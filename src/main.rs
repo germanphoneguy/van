@@ -233,6 +233,18 @@ fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
             break;
         }
 
+        if lang == Language::Rust && chars[i] == '\'' && i + 1 < len && chars[i + 1].is_alphabetic() {
+            let mut s = String::new();
+            s.push('\'');
+            i += 1;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                s.push(chars[i]);
+                i += 1;
+            }
+            out.push((s, Some(Color::Cyan)));
+            continue;
+        }
+
         if chars[i] == '"' || chars[i] == '\'' {
             let quote = chars[i];
             let mut s = String::new();
@@ -438,6 +450,12 @@ enum UndoAction {
         y: usize,
         x: usize,
         removed: String,
+    },
+    PasteBlock {
+        saved_lines: Vec<String>,
+        saved_cursor_y: usize,
+        saved_cursor_x: usize,
+        saved_dirty: bool,
     },
 }
 
@@ -1293,6 +1311,9 @@ impl Editor {
                     self.lines.insert(y, right);
                 }
             }
+            UndoAction::PasteBlock { saved_lines, .. } => {
+                self.lines = saved_lines;
+            }
         }
 
         self.cursor_x = entry.cursor_x;
@@ -1732,10 +1753,20 @@ impl Editor {
     }
 
     fn handle_paste(&mut self, text: String) {
+        let saved_lines = self.lines.clone();
+        let saved_cursor_y = self.cursor_y;
+        let saved_cursor_x = self.cursor_x;
+        let saved_dirty = self.dirty;
+
         for ch in text.chars() {
             match ch {
                 '\n' | '\r' => {
-                    self.lines.insert(self.cursor_y + 1, String::new());
+                    let y = self.cursor_y;
+                    let x = self.cursor_x;
+                    let split_byte = char_to_byte_idx(&self.lines[y], x);
+                    let right = self.lines[y][split_byte..].to_string();
+                    self.lines[y].truncate(split_byte);
+                    self.lines.insert(y + 1, right);
                     self.cursor_y += 1;
                     self.cursor_x = 0;
                     self.dirty = true;
@@ -1757,6 +1788,14 @@ impl Editor {
                 _ => {}
             }
         }
+        self.undo_stack.push(UndoEntry {
+            action: UndoAction::PasteBlock { saved_lines, saved_cursor_y, saved_cursor_x, saved_dirty },
+            cursor_x: saved_cursor_x,
+            cursor_y: saved_cursor_y,
+            offset_x: self.offset_x,
+            offset_y: self.offset_y,
+            dirty: saved_dirty,
+        });
         self.request_full_redraw();
     }
 
