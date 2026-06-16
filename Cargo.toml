@@ -1,6 +1,6 @@
 [package]
 name = "van-editor"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "Van(formely: VimnANo) is a simple rust code editor with advanced vim-like features."
 license = "GPL-3.0-only"
@@ -8,6 +8,10 @@ repository = "https://github.com/germanphoneguy/van"
 readme = "README.md"
 keywords = ["editor", "terminal", "groq", "rust", "lightweight"]
 categories = ["command-line-utilities", "text-editors"]
+
+[[bin]]
+name = "van"
+path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.29.0"
