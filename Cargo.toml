@@ -1,5 +1,5 @@
 [package]
-name = "van"
+name = "van-editor"
 version = "0.2.3"
 edition = "2024"
 description = "Van(formely: VimnANo) is a simple rust code editor with advanced vim-like features."
