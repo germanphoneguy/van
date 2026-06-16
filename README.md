@@ -3,7 +3,7 @@ Van (formerly VimnANo) is a simple terminal code editor with vim-like commands.
 
 ## Installation
 
-Requires curl (for AI features) and cargo.
+Requires cargo.
 
 ```bash
 cargo install van-editor
@@ -52,4 +52,5 @@ van [FILENAME]
 - Language-aware auto-indentation
 - Search with highlighting
 - Undo support
-- Groq AI integration (`:ai`)
+- Multi-provider AI integration (`:ai` — Groq, OpenAI, Anthropic, Gemini, OpenRouter, OpenCode Zen)
+- AI config TUI (`:ai --config`)

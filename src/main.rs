@@ -7,6 +7,7 @@ use crossterm::{
 };
 use std::{
     cmp,
+    collections::HashMap,
     env,
     fs,
     io::{self, stdout, Stdout, Write},
@@ -14,6 +15,7 @@ use std::{
     process::Command,
     time::{Duration, Instant},
 };
+use serde::{Deserialize, Serialize};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SEARCH_STATUS_SECONDS: u64 = 5;
@@ -21,6 +23,117 @@ const MESSAGE_STATUS_SECONDS: u64 = 3;
 const AI_STATUS_SECONDS: u64 = 9;
 const POLL_FALLBACK_MS: u64 = 250;
 const INDENT_WIDTH: usize = 4;
+
+const PROVIDER_INFO: &[(&str, &str, &[&str])] = &[
+    ("groq", "https://api.groq.com/openai/v1/chat/completions",
+     &["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it", "llama-3.1-8b-instant"]),
+    ("openai", "https://api.openai.com/v1/chat/completions",
+     &["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]),
+    ("anthropic", "https://api.anthropic.com/v1/messages",
+     &["claude-3-5-sonnet-20241022", "claude-3-opus-20240229", "claude-3-haiku-20240307"]),
+    ("gemini", "https://generativelanguage.googleapis.com/v1beta/models/",
+     &["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]),
+    ("openrouter", "https://openrouter.ai/api/v1/chat/completions",
+     &["openai/gpt-4o"]),
+    ("opencode-zen", "https://opencode.ai/zen/v1/chat/completions",
+     &["big-pickle", "deepseek-v4-flash-free", "gpt-5.4", "gpt-5.4-mini", "claude-sonnet-4"]),
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiConfig {
+    provider: String,
+    api_keys: HashMap<String, String>,
+    models: HashMap<String, String>,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        let mut models = HashMap::new();
+        for (name, _, model_list) in PROVIDER_INFO {
+            if let Some(m) = model_list.first() {
+                models.insert(name.to_string(), m.to_string());
+            }
+        }
+        let api_keys = load_old_groq_key()
+            .map(|k| {
+                let mut m = HashMap::new();
+                m.insert("groq".to_string(), k);
+                m
+            })
+            .unwrap_or_default();
+        Self { provider: "groq".to_string(), api_keys, models }
+    }
+}
+
+impl AiConfig {
+    fn save(&self) -> io::Result<()> {
+        let path = ai_config_path()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config path"))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    fn endpoint(&self) -> &str {
+        PROVIDER_INFO.iter()
+            .find(|(n, _, _)| *n == self.provider)
+            .map(|(_, e, _)| *e)
+            .unwrap_or("https://api.groq.com/openai/v1/chat/completions")
+    }
+
+    fn active_model(&self) -> String {
+        self.models.get(&self.provider)
+            .cloned()
+            .or_else(|| PROVIDER_INFO.iter()
+                .find(|(n, _, m)| *n == self.provider && !m.is_empty())
+                .and_then(|(_, _, m)| m.first().map(|s| s.to_string())))
+            .unwrap_or_else(|| "llama-3.3-70b-versatile".to_string())
+    }
+}
+
+fn ai_config_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("van").join("ai_config.json"))
+}
+
+fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        Some(PathBuf::from(xdg))
+    } else if let Some(home) = env::var_os("HOME") {
+        Some(PathBuf::from(home).join(".config"))
+    } else {
+        env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+}
+
+fn load_ai_config() -> AiConfig {
+    let path = match ai_config_path() {
+        Some(p) => p,
+        None => return AiConfig::default(),
+    };
+    match fs::read_to_string(&path) {
+        Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
+        Err(_) => {
+            let c = AiConfig::default();
+            let _ = c.save();
+            c
+        }
+    }
+}
+
+fn load_old_groq_key() -> Option<String> {
+    let base = config_dir()?;
+    let path = base.join("van_groq_api_key");
+    let key = fs::read_to_string(path).ok()?;
+    let trimmed = key.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Language {
@@ -235,7 +348,8 @@ fn main() -> io::Result<()> {
                 println!("  :chmod  Make .sh file executable");
                 println!("  :syntax on/off  Toggle syntax highlighting");
                 println!("  :!cmd   Run shell command");
-                println!("  :ai ...  Ask Groq AI");
+                println!("  :ai <prompt>   Ask AI (Groq/OpenAI/Anthropic/Gemini/OpenRouter/OpenCode Zen)");
+                println!("  :ai --config   Open AI config TUI");
                 return Ok(());
             }
             _ => {}
@@ -266,6 +380,9 @@ fn main() -> io::Result<()> {
                 Event::Resize(_, _) => {
                     editor.request_full_redraw();
                 }
+                Event::Paste(text) => {
+                    editor.handle_paste(text);
+                }
                 _ => {}
             }
         }
@@ -287,7 +404,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter(out: &mut Stdout) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(out, terminal::EnterAlternateScreen)?;
+        execute!(out, terminal::EnterAlternateScreen, event::EnableBracketedPaste)?;
         Ok(Self)
     }
 }
@@ -295,7 +412,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = stdout();
-        let _ = execute!(out, cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(out, event::DisableBracketedPaste, cursor::Show, terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -338,7 +455,8 @@ struct UndoEntry {
 enum InputMode {
     Insert,
     Command,
-    AwaitGroqKey,
+    AwaitAiKey,
+    AiConfig,
 }
 
 struct Editor {
@@ -360,9 +478,11 @@ struct Editor {
     mode: InputMode,
     command_buffer: String,
 
-    groq_api_key: Option<String>,
-    groq_key_buffer: String,
+    ai_config: AiConfig,
+    config_key_buffer: String,
     pending_ai_request: Option<String>,
+    ai_config_field: usize,
+    ai_config_editing: bool,
 
     temp_status: Option<(String, Instant)>,
     dirty: bool,
@@ -409,9 +529,11 @@ impl Editor {
             confirm_exit: false,
             mode: InputMode::Insert,
             command_buffer: String::new(),
-            groq_api_key: load_groq_api_key(),
-            groq_key_buffer: String::new(),
+            ai_config: load_ai_config(),
+            config_key_buffer: String::new(),
             pending_ai_request: None,
+            ai_config_field: 0,
+            ai_config_editing: false,
             temp_status: None,
             dirty: false,
             undo_stack: Vec::new(),
@@ -596,44 +718,45 @@ impl Editor {
         }
 
         match self.mode {
-            InputMode::AwaitGroqKey => {
+            InputMode::AwaitAiKey => {
                 match key.code {
                     KeyCode::Esc => {
                         self.mode = InputMode::Insert;
-                        self.groq_key_buffer.clear();
+                        self.config_key_buffer.clear();
                         self.pending_ai_request = None;
-                        self.set_temp_status("Groq key entry cancelled".to_string(), MESSAGE_STATUS_SECONDS);
+                        self.set_temp_status("API key entry cancelled".to_string(), MESSAGE_STATUS_SECONDS);
                         self.request_redraw();
                     }
                     KeyCode::Enter => {
-                        let key_value = self.groq_key_buffer.trim().to_string();
+                        let key_value = self.config_key_buffer.trim().to_string();
                         if key_value.is_empty() {
-                            self.set_temp_status("Groq API key cannot be empty".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.set_temp_status("API key cannot be empty".to_string(), MESSAGE_STATUS_SECONDS);
                             self.request_redraw();
                             return false;
                         }
 
-                        if save_groq_api_key(&key_value).is_ok() {
-                            self.groq_api_key = Some(key_value);
+                        let prov = self.ai_config.provider.clone();
+                        self.ai_config.api_keys.insert(prov.clone(), key_value);
+                        if self.ai_config.save().is_ok() {
                             self.mode = InputMode::Insert;
-                            self.groq_key_buffer.clear();
-                            self.set_temp_status("Groq API key saved".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.config_key_buffer.clear();
+                            self.set_temp_status(format!("{} API key saved", prov), MESSAGE_STATUS_SECONDS);
                             self.request_redraw();
 
                             if let Some(req) = self.pending_ai_request.take() {
                                 self.run_ai_command(req);
                             }
                         } else {
-                            self.set_temp_status("Failed to save Groq API key".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.set_temp_status("Failed to save API key".to_string(), MESSAGE_STATUS_SECONDS);
                             self.request_redraw();
                         }
                     }
                     KeyCode::Backspace => {
-                        self.groq_key_buffer.pop();
+                        self.config_key_buffer.pop();
                         self.request_redraw();
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.groq_key_buffer.push(c);
+                        self.config_key_buffer.push(c);
                         self.request_redraw();
                     }
                     _ => {}
@@ -668,6 +791,94 @@ impl Editor {
                         self.request_redraw();
                     }
                     _ => {}
+                }
+                return false;
+            }
+
+            InputMode::AiConfig => {
+                if self.ai_config_editing {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.ai_config_editing = false;
+                            self.config_key_buffer.clear();
+                            self.request_redraw();
+                        }
+                        KeyCode::Enter => {
+                            let value = self.config_key_buffer.trim().to_string();
+                            if !value.is_empty() {
+                                let prov = self.ai_config.provider.clone();
+                                match self.ai_config_field {
+                                    1 => { self.ai_config.api_keys.insert(prov.clone(), value.clone()); }
+                                    2 => { self.ai_config.models.insert(prov, value); }
+                                    _ => {}
+                                }
+                                let _ = self.ai_config.save();
+                            }
+                            self.ai_config_editing = false;
+                            self.config_key_buffer.clear();
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Backspace => {
+                            self.config_key_buffer.pop();
+                            self.request_redraw();
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.config_key_buffer.push(c);
+                            self.request_redraw();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.mode = InputMode::Insert;
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Up => {
+                            self.ai_config_field = self.ai_config_field.saturating_sub(1);
+                            self.request_redraw();
+                        }
+                        KeyCode::Down => {
+                            if self.ai_config_field < 2 { self.ai_config_field += 1; }
+                            self.request_redraw();
+                        }
+                        KeyCode::Left | KeyCode::Right => {
+                            if self.ai_config_field == 0 {
+                                let names: Vec<&str> = PROVIDER_INFO.iter().map(|(n, _, _)| *n).collect();
+                                let idx = names.iter().position(|n| **n == self.ai_config.provider).unwrap_or(0);
+                                let new_idx = if key.code == KeyCode::Right {
+                                    (idx + 1) % names.len()
+                                } else {
+                                    (idx + names.len() - 1) % names.len()
+                                };
+                                self.ai_config.provider = names[new_idx].to_string();
+                                let _ = self.ai_config.save();
+                                self.request_full_redraw();
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if self.ai_config_field == 0 {
+                                let names: Vec<&str> = PROVIDER_INFO.iter().map(|(n, _, _)| *n).collect();
+                                let idx = names.iter().position(|n| **n == self.ai_config.provider).unwrap_or(0);
+                                let new_idx = (idx + 1) % names.len();
+                                self.ai_config.provider = names[new_idx].to_string();
+                                let _ = self.ai_config.save();
+                                self.request_full_redraw();
+                            } else {
+                                self.ai_config_editing = true;
+                                self.config_key_buffer.clear();
+                                if self.ai_config_field == 1 {
+                                    if let Some(k) = self.ai_config.api_keys.get(&self.ai_config.provider) {
+                                        self.config_key_buffer = k.clone();
+                                    }
+                                } else if self.ai_config_field == 2 {
+                                    self.config_key_buffer = self.ai_config.active_model();
+                                }
+                                self.request_redraw();
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 return false;
             }
@@ -862,7 +1073,15 @@ impl Editor {
         }
 
         if let Some(rest) = raw.strip_prefix("ai") {
-            self.run_ai_command(rest.trim().to_string());
+            let rest = rest.trim();
+            if rest == "--config" || rest.starts_with("--config ") {
+                self.mode = InputMode::AiConfig;
+                self.ai_config_field = 0;
+                self.ai_config_editing = false;
+                self.request_full_redraw();
+                return false;
+            }
+            self.run_ai_command(rest.to_string());
             return false;
         }
 
@@ -909,84 +1128,123 @@ impl Editor {
             request
         };
 
-        if self.groq_api_key.is_none() {
+        let prov = self.ai_config.provider.clone();
+        let has_key = self.ai_config.api_keys.contains_key(&prov);
+
+        if !has_key {
             self.pending_ai_request = Some(request);
-            self.mode = InputMode::AwaitGroqKey;
-            self.groq_key_buffer.clear();
-            self.set_temp_status("Enter Groq API key".to_string(), MESSAGE_STATUS_SECONDS);
+            self.mode = InputMode::AwaitAiKey;
+            self.config_key_buffer.clear();
+            self.set_temp_status(format!("Enter {} API key", prov), MESSAGE_STATUS_SECONDS);
             self.request_redraw();
             return;
         }
 
-        let key = self.groq_api_key.as_ref().unwrap().clone();
-        match self.call_groq_api(&key, &request) {
+        self.set_temp_status("AI thinking...".to_string(), AI_STATUS_SECONDS);
+        self.needs_redraw = true;
+        let _ = self.render(&mut stdout());
+
+        match self.call_ai_api(&request) {
             Ok(reply) => {
-                self.ai_output = Some(reply.lines().map(|l| l.to_string()).collect());
+                let wrap_width = terminal::size().ok().map(|(w, _)| w as usize).unwrap_or(80);
+                let lines: Vec<String> = reply.lines()
+                    .flat_map(|line| {
+                        if line.chars().count() <= wrap_width {
+                            vec![line.to_string()]
+                        } else {
+                            line.chars()
+                                .collect::<Vec<_>>()
+                                .chunks(wrap_width)
+                                .map(|c| c.iter().collect())
+                                .collect()
+                        }
+                    })
+                    .collect();
+                self.ai_output = Some(lines);
                 self.ai_scroll = 0;
                 self.request_full_redraw();
             }
             Err(e) => {
-                self.set_temp_status(format!("Groq error: {}", e), AI_STATUS_SECONDS);
+                self.set_temp_status(format!("AI error: {}", e), AI_STATUS_SECONDS);
             }
         }
     }
 
-    fn call_groq_api(&self, api_key: &str, request: &str) -> io::Result<String> {
+    fn call_ai_api(&self, request: &str) -> io::Result<String> {
         let file_text = self.lines.join("\n");
-        let model = env::var("GROQ_MODEL").unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
+        let system_prompt = "You are a concise coding assistant. Be practical and direct.";
+        let user_content = format!("Current file:\n\n{}\n\nUser request:\n{}", file_text, request);
+        let prov = &self.ai_config.provider;
+        let api_key = self.ai_config.api_keys.get(prov)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no API key for {}", prov)))?;
+        let model = self.ai_config.active_model();
+        let endpoint = self.ai_config.endpoint();
 
-        let body = format!(
-            r#"{{"model":"{}","messages":[{{"role":"system","content":"{}"}},{{"role":"user","content":"Current file:\n\n{}\n\nUser request:\n{}"}}],"temperature":0.2}}"#,
-            json_escape(&model),
-            json_escape("You are a concise coding assistant. Be practical and direct."),
-            json_escape(&file_text),
-            json_escape(request)
-        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        let output = Command::new("curl")
-            .args([
-                "-sS",
-                "-X",
-                "POST",
-                "https://api.groq.com/openai/v1/chat/completions",
-                "-H",
-                &format!("Authorization: Bearer {}", api_key),
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body,
-            ])
-            .output()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("curl failed to start: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let msg = if !stderr.is_empty() { stderr } else { stdout };
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                if msg.is_empty() {
-                    "Groq request failed".to_string()
-                } else {
-                    msg
-                },
-            ));
-        }
-
-        let response = String::from_utf8_lossy(&output.stdout).to_string();
-
-        if let Some(reply) = extract_groq_content(&response) {
-            if reply.trim().is_empty() {
-                Err(io::Error::new(io::ErrorKind::Other, "empty Groq reply"))
-            } else {
-                Ok(reply)
+        let json: serde_json::Value = match prov.as_str() {
+            "anthropic" => {
+                let body = serde_json::json!({
+                    "model": model,
+                    "max_tokens": 4096,
+                    "messages": [{"role": "user", "content": user_content}]
+                });
+                let resp = client.post(endpoint)
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                resp.json::<serde_json::Value>()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
             }
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "could not extract Groq response content",
-            ))
-        }
+            "gemini" => {
+                let url = format!("{}:generateContent?key={}", endpoint, api_key);
+                let body = serde_json::json!({
+                    "contents": [{"parts": [{"text": user_content}]}]
+                });
+                let resp = client.post(&url)
+                    .json(&body)
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                resp.json::<serde_json::Value>()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            }
+            _ => {
+                let body = serde_json::json!({
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    "temperature": 0.2
+                });
+                let resp = client.post(endpoint)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .json(&body)
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                resp.json::<serde_json::Value>()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            }
+        };
+
+        let reply = match prov.as_str() {
+            "anthropic" => json["content"][0]["text"].as_str(),
+            "gemini" => json["candidates"][0]["content"]["parts"][0]["text"].as_str(),
+            _ => json["choices"][0]["message"]["content"].as_str(),
+        };
+
+        reply
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty AI response"))
     }
 
     fn push_undo(&mut self, action: UndoAction) {
@@ -1070,11 +1328,12 @@ impl Editor {
             return format!("Command: {}", self.command_buffer);
         }
 
-        if self.mode == InputMode::AwaitGroqKey {
-            let masked = "*".repeat(self.groq_key_buffer.chars().count());
+        if self.mode == InputMode::AwaitAiKey {
+            let masked = "*".repeat(self.config_key_buffer.chars().count());
+            let prov = &self.ai_config.provider;
             return format!(
-                "Groq API key: {} | Enter = save | Esc = cancel",
-                masked
+                "{} API key: {} | Enter = save | Esc = cancel",
+                prov, masked
             );
         }
 
@@ -1111,6 +1370,57 @@ impl Editor {
         let (w_u16, h_u16) = terminal::size()?;
         let width = w_u16 as usize;
         let height = h_u16 as usize;
+
+        if self.mode == InputMode::AiConfig {
+            queue!(out, Clear(ClearType::All))?;
+            let text_rows = height.saturating_sub(1);
+            let mut cfg_lines: Vec<String> = Vec::new();
+
+            cfg_lines.push(" AI config".to_string());
+            cfg_lines.push(String::new());
+
+            let prov = &self.ai_config.provider;
+            let pmark = if self.ai_config_field == 0 && !self.ai_config_editing { ">" } else { " " };
+            cfg_lines.push(format!("{} Provider: {}", pmark, prov));
+
+            let kmark = if self.ai_config_field == 1 && !self.ai_config_editing { ">" } else { " " };
+            let key_disp = if self.ai_config.api_keys.contains_key(prov) { "********" } else { "not set" };
+            cfg_lines.push(format!("{} API Key: {}", kmark, key_disp));
+
+            let mmark = if self.ai_config_field == 2 && !self.ai_config_editing { ">" } else { " " };
+            cfg_lines.push(format!("{} Model: {}", mmark, self.ai_config.active_model()));
+
+            cfg_lines.push(String::new());
+
+            if self.ai_config_editing {
+                let label = match self.ai_config_field {
+                    1 => "API Key",
+                    2 => "Model",
+                    _ => "Value",
+                };
+                cfg_lines.push(format!("{}: {}", label, self.config_key_buffer));
+                cfg_lines.push(String::new());
+            }
+
+            cfg_lines.push("↑/↓ select  ←/→ cycle provider  Enter edit  Esc exit".to_string());
+
+            for i in 0..text_rows {
+                let line = cfg_lines.get(i).map(|s| truncate_to_width(s, width)).unwrap_or_default();
+                queue!(out, cursor::MoveTo(0, i as u16), Print(line))?;
+            }
+
+            let status = "AI CONFIG";
+            let padded = pad_to_width(&truncate_to_width(status, width), width);
+            if height > 0 {
+                queue!(out, cursor::MoveTo(0, (height - 1) as u16),
+                    SetAttribute(Attribute::Reverse), Print(padded), SetAttribute(Attribute::Reset))?;
+            }
+
+            out.flush()?;
+            self.needs_redraw = false;
+            self.force_full_redraw = false;
+            return Ok(());
+        }
 
         if let Some(ai_lines) = &self.ai_output {
             queue!(out, Clear(ClearType::All))?;
@@ -1421,6 +1731,35 @@ impl Editor {
         self.dirty = true;
     }
 
+    fn handle_paste(&mut self, text: String) {
+        for ch in text.chars() {
+            match ch {
+                '\n' | '\r' => {
+                    self.lines.insert(self.cursor_y + 1, String::new());
+                    self.cursor_y += 1;
+                    self.cursor_x = 0;
+                    self.dirty = true;
+                }
+                '\t' => {
+                    for _ in 0..4 {
+                        let line = &mut self.lines[self.cursor_y];
+                        line.insert(char_to_byte_idx(line, self.cursor_x), ' ');
+                        self.cursor_x += 1;
+                    }
+                    self.dirty = true;
+                }
+                c if !c.is_control() => {
+                    let line = &mut self.lines[self.cursor_y];
+                    line.insert(char_to_byte_idx(line, self.cursor_x), c);
+                    self.cursor_x += 1;
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+        self.request_full_redraw();
+    }
+
     fn find_first(&self, query: &str) -> Option<(usize, usize)> {
         for (y, line) in self.lines.iter().enumerate() {
             if let Some(byte_idx) = line.find(query) {
@@ -1454,110 +1793,6 @@ fn pad_to_width(s: &str, width: usize) -> String {
         out.push_str(&" ".repeat(width - len));
     }
     out
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 16);
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn extract_groq_content(resp: &str) -> Option<String> {
-    let marker = "\"content\":\"";
-    let start = resp.find(marker)? + marker.len();
-    let mut out = String::new();
-    let mut chars = resp[start..].chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => return Some(out),
-            '\\' => {
-                let esc = chars.next()?;
-                match esc {
-                    '"' => out.push('"'),
-                    '\\' => out.push('\\'),
-                    '/' => out.push('/'),
-                    'b' => out.push('\u{08}'),
-                    'f' => out.push('\u{0C}'),
-                    'n' => out.push('\n'),
-                    'r' => out.push('\r'),
-                    't' => out.push('\t'),
-                    'u' => {
-                        let mut hex = String::new();
-                        for _ in 0..4 {
-                            hex.push(chars.next()?);
-                        }
-                        if let Ok(code) = u16::from_str_radix(&hex, 16) {
-                            if let Some(c) = char::from_u32(code as u32) {
-                                out.push(c);
-                            }
-                        }
-                    }
-                    other => out.push(other),
-                }
-            }
-            other => out.push(other),
-        }
-    }
-
-    None
-}
-
-fn groq_api_key_path() -> Option<PathBuf> {
-    let base = if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg)
-    } else if let Some(home) = env::var_os("HOME") {
-        PathBuf::from(home).join(".config")
-    } else if let Some(profile) = env::var_os("USERPROFILE") {
-        PathBuf::from(profile)
-    } else {
-        return None;
-    };
-
-    Some(base.join("van_groq_api_key"))
-}
-
-fn load_groq_api_key() -> Option<String> {
-    let path = groq_api_key_path()?;
-    fs::read_to_string(path).ok().and_then(|s| {
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    })
-}
-
-fn save_groq_api_key(key: &str) -> io::Result<()> {
-    let path = groq_api_key_path()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config path available"))?;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::write(&path, key.trim())?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
-
-    Ok(())
 }
 
 fn sanitize_str(s: &str) -> String {
