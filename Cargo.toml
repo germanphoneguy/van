@@ -7,7 +7,7 @@ license = "GPL-3.0-only"
 repository = "https://github.com/germanphoneguy/van"
 readme = "README.md"
 keywords = ["editor", "terminal", "groq", "rust", "lightweight"]
-categories = ["command-line-utilities", "development-tools::editors"]
+categories = ["command-line-utilities", "text-editors"]
 
 [dependencies]
 crossterm = "0.29.0"
