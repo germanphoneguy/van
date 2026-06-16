@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const VERSION: &str = "0.2.3";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SEARCH_STATUS_SECONDS: u64 = 5;
 const MESSAGE_STATUS_SECONDS: u64 = 3;
 const AI_STATUS_SECONDS: u64 = 9;
