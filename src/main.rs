@@ -2,7 +2,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, queue,
-    style::{Attribute, Print, SetAttribute},
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use std::{
@@ -47,6 +47,159 @@ fn detect_language(filename: &str) -> Language {
     }
 }
 
+fn is_keyword(word: &str, lang: Language) -> bool {
+    match lang {
+        Language::Rust => matches!(word,
+            "as" | "async" | "await" | "break" | "const" | "continue" | "crate"
+            | "dyn" | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if"
+            | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut"
+            | "pub" | "ref" | "return" | "self" | "Self" | "static" | "struct"
+            | "super" | "trait" | "true" | "type" | "unsafe" | "use" | "where"
+            | "while" | "abstract" | "become" | "box" | "do" | "final" | "macro"
+            | "override" | "priv" | "typeof" | "unsized" | "virtual" | "yield"),
+        Language::C => matches!(word,
+            "auto" | "break" | "case" | "const" | "continue" | "default" | "do"
+            | "else" | "enum" | "extern" | "for" | "goto" | "if" | "register"
+            | "return" | "signed" | "sizeof" | "static" | "struct" | "switch"
+            | "typedef" | "union" | "unsigned" | "volatile" | "while" | "void"
+            | "int" | "char" | "float" | "double" | "long" | "short"),
+        Language::Python => matches!(word,
+            "False" | "None" | "True" | "and" | "as" | "assert" | "async"
+            | "await" | "break" | "class" | "continue" | "def" | "del" | "elif"
+            | "else" | "except" | "finally" | "for" | "from" | "global" | "if"
+            | "import" | "in" | "is" | "lambda" | "nonlocal" | "not" | "or"
+            | "pass" | "raise" | "return" | "try" | "while" | "with" | "yield"),
+        Language::Shell => matches!(word,
+            "if" | "then" | "else" | "elif" | "fi" | "for" | "while" | "do"
+            | "done" | "case" | "esac" | "in" | "function" | "return" | "exit"
+            | "export" | "local" | "declare" | "source" | "select"),
+        Language::PlainText => false,
+    }
+}
+
+fn is_type(word: &str, lang: Language) -> bool {
+    match lang {
+        Language::Rust => matches!(word,
+            "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64"
+            | "u128" | "isize" | "usize" | "f32" | "f64" | "bool" | "char" | "str"
+            | "String" | "Vec" | "HashMap" | "Box" | "Option" | "Result" | "Arc"
+            | "Rc" | "Mutex" | "RefCell" | "Path" | "PathBuf" | "Duration"),
+        Language::C => false,
+        Language::Python => matches!(word,
+            "int" | "float" | "str" | "bool" | "list" | "dict" | "tuple" | "set"
+            | "bytes" | "bytearray" | "NoneType" | "type" | "object"),
+        Language::Shell => false,
+        Language::PlainText => false,
+    }
+}
+
+fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
+    let mut out: Vec<(String, Option<Color>)> = Vec::new();
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    let comment_start = match lang {
+        Language::Python | Language::Shell => "#",
+        Language::PlainText => "",
+        _ => "//",
+    };
+
+    while i < len {
+        if !comment_start.is_empty() && i + comment_start.len() <= len {
+            let rest: String = chars[i..].iter().collect();
+            if rest.starts_with(comment_start) {
+                let text: String = chars[i..].iter().collect();
+                out.push((sanitize_str(&text), Some(Color::DarkGreen)));
+                break;
+            }
+        }
+        if lang != Language::PlainText && lang != Language::Shell && i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
+            let text: String = chars[i..].iter().collect();
+            out.push((sanitize_str(&text), Some(Color::DarkGreen)));
+            break;
+        }
+
+        if chars[i] == '"' || chars[i] == '\'' {
+            let quote = chars[i];
+            let mut s = String::new();
+            s.push(quote);
+            i += 1;
+            while i < len {
+                s.push(chars[i]);
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 1;
+                    s.push(chars[i]);
+                } else if chars[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push((sanitize_str(&s), Some(Color::Green)));
+            continue;
+        }
+
+        if chars[i].is_ascii_digit() || (chars[i] == '.' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
+            let mut s = String::new();
+            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                s.push(chars[i]);
+                i += 1;
+            }
+            out.push((s, Some(Color::Magenta)));
+            continue;
+        }
+
+        if chars[i].is_alphabetic() || chars[i] == '_' {
+            let mut s = String::new();
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                s.push(chars[i]);
+                i += 1;
+            }
+            let color = if is_keyword(&s, lang) {
+                Some(Color::Blue)
+            } else if is_type(&s, lang) {
+                Some(Color::Cyan)
+            } else {
+                None
+            };
+            out.push((s, color));
+            continue;
+        }
+
+        let mut s = String::new();
+        s.push(chars[i]);
+        i += 1;
+
+        if lang == Language::Rust {
+            if s == "&" && i < len && chars[i] == '\'' {
+                s.push(chars[i]);
+                i += 1;
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                out.push((s, Some(Color::Cyan)));
+                continue;
+            }
+            if s == "'" && i < len && chars[i].is_alphabetic() {
+                s.push(chars[i]);
+                i += 1;
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                out.push((s, Some(Color::Cyan)));
+                continue;
+            }
+        }
+
+        out.push((s, None));
+    }
+
+    out
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -80,6 +233,7 @@ fn main() -> io::Result<()> {
                 println!("  :wq!    Save and quit");
                 println!("  :line   Jump to line");
                 println!("  :chmod  Make .sh file executable");
+                println!("  :syntax on/off  Toggle syntax highlighting");
                 println!("  :!cmd   Run shell command");
                 println!("  :ai ...  Ask Groq AI");
                 return Ok(());
@@ -223,6 +377,8 @@ struct Editor {
 
     ai_output: Option<Vec<String>>,
     ai_scroll: usize,
+
+    syntax_highlight: bool,
 }
 
 impl Editor {
@@ -266,6 +422,7 @@ impl Editor {
 
             ai_output: None,
             ai_scroll: 0,
+            syntax_highlight: true,
         } 
     }
 
@@ -336,6 +493,13 @@ impl Editor {
         if self.confirm_exit {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => return true,
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    if self.save().is_ok() {
+                        return true;
+                    }
+                    self.set_temp_status("Save failed".to_string(), MESSAGE_STATUS_SECONDS);
+                    self.request_redraw();
+                }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.confirm_exit = false;
                     self.set_temp_status("Exit cancelled".to_string(), MESSAGE_STATUS_SECONDS);
@@ -392,6 +556,9 @@ impl Editor {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('x') => {
+                    if !self.dirty {
+                        return true;
+                    }
                     self.confirm_exit = true;
                     self.request_redraw();
                 }
@@ -627,6 +794,25 @@ impl Editor {
                     self.set_temp_status(format!("Save failed: {}", self.filename), MESSAGE_STATUS_SECONDS);
                     return false;
                 }
+            }
+            "syntax" => {
+                self.syntax_highlight = !self.syntax_highlight;
+                let status = if self.syntax_highlight { "on" } else { "off" };
+                self.set_temp_status(format!("Syntax highlighting {}", status), MESSAGE_STATUS_SECONDS);
+                self.request_full_redraw();
+                return false;
+            }
+            "syntax on" | "syntax enable" => {
+                self.syntax_highlight = true;
+                self.set_temp_status("Syntax highlighting enabled".to_string(), MESSAGE_STATUS_SECONDS);
+                self.request_full_redraw();
+                return false;
+            }
+            "syntax off" | "syntax disable" => {
+                self.syntax_highlight = false;
+                self.set_temp_status("Syntax highlighting disabled".to_string(), MESSAGE_STATUS_SECONDS);
+                self.request_full_redraw();
+                return false;
             }
             "chmod" => {
                 // Feature: Only allow chmod on shell scripts detected via filename
@@ -868,7 +1054,7 @@ impl Editor {
 
     fn current_status(&self) -> String {
         if self.confirm_exit {
-            return "Exit without saving? (y = quit, n = cancel)".to_string();
+            return "Exit without saving? (y = quit, s = save & quit, n = cancel)".to_string();
         }
 
         if self.in_search {
@@ -1056,6 +1242,10 @@ impl Editor {
         let end_byte = char_to_byte_idx(line, self.offset_x + width);
         let visible = &line[start_byte..end_byte];
 
+        if self.search_highlight.is_empty() && self.syntax_highlight {
+            return self.write_colored(out, visible);
+        }
+
         if self.search_highlight.is_empty() {
             queue!(out, Print(sanitize_str(visible)))?;
             return Ok(());
@@ -1087,6 +1277,18 @@ impl Editor {
             }
         }
 
+        Ok(())
+    }
+
+    fn write_colored(&self, out: &mut Stdout, visible: &str) -> io::Result<()> {
+        let segments = tokenize(visible, self.language);
+        for (text, color) in &segments {
+            if let Some(c) = color {
+                queue!(out, SetForegroundColor(*c), Print(text.as_str()), ResetColor)?;
+            } else {
+                queue!(out, Print(text.as_str()))?;
+            }
+        }
         Ok(())
     }
 

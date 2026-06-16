@@ -1,25 +1,55 @@
 # Van
-Van(formely: VimnANo) is a simple rust code editor with advanced vim-like features.
+Van (formerly VimnANo) is a simple terminal code editor with vim-like commands.
 
-**installation**
+## Installation
 
-either download it with cargo or compile yourself:
+Requires curl (for AI features) and cargo.
 
-!!This editor needs curl and cargo, if you have not installed it please do!!
-
-Cargo:
 ```bash
 cargo install van-editor
 ```
-Compile yourself:
+
+Or build from source:
 ```bash
 git clone https://github.com/germanphoneguy/van
-```
-```bash
 cd van
-```
-```
 cargo install --path .
 ```
 
-Have fun with van!
+## Usage
+
+```bash
+van [FILENAME]
+```
+
+## Controls
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+S` | Save |
+| `Ctrl+F` | Find |
+| `Ctrl+Z` | Undo |
+| `Ctrl+X` | Exit |
+| `Esc` | Command mode |
+
+## Commands (after `Esc`)
+
+| Command | Action |
+|---------|--------|
+| `:w` | Save |
+| `:q` | Quit (if clean) |
+| `:q!` | Quit without saving |
+| `:wq` / `:wq!` | Save and quit |
+| `:N` | Jump to line N |
+| `:chmod` | Make `.sh` file executable |
+| `:syntax on/off` | Toggle syntax highlighting |
+| `:!cmd` | Run shell command |
+| `:ai ...` | Ask Groq AI |
+
+## Features
+
+- Syntax highlighting for Rust, Python, C, Shell scripts
+- Language-aware auto-indentation
+- Search with highlighting
+- Undo support
+- Groq AI integration (`:ai`)
