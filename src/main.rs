@@ -695,9 +695,14 @@ impl Editor {
             KeyCode::Down => {
                 if self.cursor_y + 1 < self.lines.len() {
                     self.cursor_y += 1;
-                    self.cursor_x = cmp::min(self.cursor_x, self.line_len(self.cursor_y));
-                    self.request_redraw();
+                } else if self.cursor_y + 1 == self.lines.len()
+                    && !self.lines.last().map_or(true, |l| l.is_empty())
+                {
+                    self.lines.push(String::new());
+                    self.cursor_y += 1;
                 }
+                self.cursor_x = cmp::min(self.cursor_x, self.line_len(self.cursor_y));
+                self.request_redraw();
             }
 
             KeyCode::Left => {
