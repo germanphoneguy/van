@@ -15,6 +15,7 @@ use std::{
     process::Command,
     time::{Duration, Instant},
 };
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,8 +43,10 @@ const PROVIDER_INFO: &[(&str, &str, &[&str])] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AiConfig {
     provider: String,
-    api_keys: HashMap<String, String>,
     models: HashMap<String, String>,
+    anthropic_version: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    local_keys: HashMap<String, String>,
 }
 
 impl Default for AiConfig {
@@ -54,14 +57,7 @@ impl Default for AiConfig {
                 models.insert(name.to_string(), m.to_string());
             }
         }
-        let api_keys = load_old_groq_key()
-            .map(|k| {
-                let mut m = HashMap::new();
-                m.insert("groq".to_string(), k);
-                m
-            })
-            .unwrap_or_default();
-        Self { provider: "groq".to_string(), api_keys, models }
+        Self { provider: "groq".to_string(), models, anthropic_version: "2023-06-01".to_string(), local_keys: HashMap::new() }
     }
 }
 
@@ -117,13 +113,50 @@ fn load_ai_config() -> AiConfig {
         Some(p) => p,
         None => return AiConfig::default(),
     };
+    let mut migrated = false;
+
     match fs::read_to_string(&path) {
-        Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
+        Ok(c) => {
+            let raw: serde_json::Value = serde_json::from_str(&c).unwrap_or_default();
+            let mut config: AiConfig = serde_json::from_value(raw.clone()).unwrap_or_default();
+
+            if let Some(keys) = raw.get("api_keys").and_then(|k| k.as_object()) {
+                for (prov, key) in keys {
+                    if let Some(k) = key.as_str() {
+                        if !k.is_empty() && !config.local_keys.contains_key(prov) {
+                            migrate_key_to_keyring(prov, k);
+                            config.local_keys.remove(prov);
+                            migrated = true;
+                        }
+                    }
+                }
+            }
+
+            let old_groq = load_old_groq_key();
+            if let Some(k) = old_groq {
+                if !config.local_keys.contains_key("groq") {
+                    migrate_key_to_keyring("groq", &k);
+                    migrated = true;
+                }
+                let _ = fs::remove_file(config_dir().map(|d| d.join("van_groq_api_key")).unwrap());
+            }
+
+            if migrated {
+                let _ = config.save();
+            }
+            config
+        }
         Err(_) => {
             let c = AiConfig::default();
             let _ = c.save();
             c
         }
+    }
+}
+
+fn migrate_key_to_keyring(provider: &str, key: &str) {
+    if let Ok(entry) = keyring::Entry::new("van-editor", provider) {
+        let _ = entry.set_password(key);
     }
 }
 
@@ -361,6 +394,7 @@ fn main() -> io::Result<()> {
                 println!("  :syntax on/off  Toggle syntax highlighting");
                 println!("  :!cmd   Run shell command");
                 println!("  :ai <prompt>   Ask AI (Groq/OpenAI/Anthropic/Gemini/OpenRouter/OpenCode Zen)");
+                println!("  :ai -l N-M <prompt>  Ask AI about specific lines (1-indexed)");
                 println!("  :ai --config   Open AI config TUI");
                 return Ok(());
             }
@@ -393,7 +427,7 @@ fn main() -> io::Result<()> {
                     editor.request_full_redraw();
                 }
                 Event::Paste(text) => {
-                    editor.handle_paste(text);
+                    editor.handle_paste_event(text);
                 }
                 _ => {}
             }
@@ -477,10 +511,153 @@ enum InputMode {
     AiConfig,
 }
 
+#[derive(Clone)]
+enum LineSource {
+    Base(usize),
+    Overlay(String),
+}
+
+struct FileBuffer {
+    mmap: Option<Mmap>,
+    base_line_starts: Vec<usize>,
+    base_line_ends: Vec<usize>,
+    lines: Vec<LineSource>,
+    dirty: bool,
+}
+
+impl FileBuffer {
+    fn load(path: &str) -> Self {
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Self::new_empty(),
+        };
+        let mmap = match unsafe { Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(_) => return Self::new_empty(),
+        };
+        let mut line_starts = Vec::new();
+        let mut line_ends = Vec::new();
+        line_starts.push(0);
+        for i in 0..mmap.len() {
+            if mmap[i] == b'\n' {
+                let end = if i > 0 && mmap[i - 1] == b'\r' { i - 1 } else { i };
+                line_ends.push(end);
+                line_starts.push(i + 1);
+            }
+        }
+        line_ends.push(mmap.len());
+        let count = line_starts.len();
+        let lines: Vec<LineSource> = (0..count).map(LineSource::Base).collect();
+        Self {
+            mmap: Some(mmap),
+            base_line_starts: line_starts,
+            base_line_ends: line_ends,
+            lines,
+            dirty: false,
+        }
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            mmap: None,
+            base_line_starts: Vec::new(),
+            base_line_ends: Vec::new(),
+            lines: vec![LineSource::Overlay(String::new())],
+            dirty: false,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn char_len(&self, n: usize) -> usize {
+        self.get_line(n).chars().count()
+    }
+
+    fn is_last_empty(&self) -> bool {
+        self.lines.last().map_or(true, |l| match l {
+            LineSource::Base(idx) => self.base_line_ends[*idx] == self.base_line_starts[*idx],
+            LineSource::Overlay(s) => s.is_empty(),
+        })
+    }
+
+    fn get_line(&self, n: usize) -> &str {
+        match &self.lines[n] {
+            LineSource::Overlay(s) => s.as_str(),
+            LineSource::Base(idx) => {
+                let mmap = self.mmap.as_ref().expect("mmap missing for base line");
+                let start = self.base_line_starts[*idx];
+                let end = self.base_line_ends[*idx];
+                unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) }
+            }
+        }
+    }
+
+    fn get_line_mut(&mut self, n: usize) -> &mut String {
+        if matches!(self.lines[n], LineSource::Base(_)) {
+            let idx = match &self.lines[n] {
+                LineSource::Base(i) => *i,
+                _ => unreachable!(),
+            };
+            let mmap = self.mmap.as_ref().expect("mmap missing for base line");
+            let start = self.base_line_starts[idx];
+            let end = self.base_line_ends[idx];
+            let text = unsafe { String::from_utf8_unchecked(mmap[start..end].to_vec()) };
+            self.lines[n] = LineSource::Overlay(text);
+            self.dirty = true;
+        }
+        match &mut self.lines[n] {
+            LineSource::Overlay(s) => s,
+            _ => unreachable!(),
+        }
+    }
+
+    fn push(&mut self, s: String) {
+        self.lines.push(LineSource::Overlay(s));
+    }
+
+    fn insert(&mut self, n: usize, s: String) {
+        self.lines.insert(n, LineSource::Overlay(s));
+    }
+
+    fn remove(&mut self, n: usize) -> String {
+        match self.lines.remove(n) {
+            LineSource::Overlay(s) => s,
+            LineSource::Base(idx) => {
+                let mmap = self.mmap.as_ref().expect("mmap missing for base line");
+                let start = self.base_line_starts[idx];
+                let end = self.base_line_ends[idx];
+                unsafe { String::from_utf8_unchecked(mmap[start..end].to_vec()) }
+            }
+        }
+    }
+
+    fn to_file_string(&self) -> String {
+        let mut out = String::new();
+        for i in 0..self.lines.len() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(self.get_line(i));
+        }
+        out
+    }
+
+    fn clone_all(&self) -> Vec<String> {
+        (0..self.lines.len()).map(|i| self.get_line(i).to_string()).collect()
+    }
+
+    fn restore_from_snapshot(&mut self, snapshot: Vec<String>, dirty: bool) {
+        self.lines = snapshot.into_iter().map(LineSource::Overlay).collect();
+        self.dirty = dirty;
+    }
+}
+
 struct Editor {
     language: Language,
     filename: String,
-    lines: Vec<String>,
+    buffer: FileBuffer,
 
     cursor_x: usize,
     cursor_y: usize,
@@ -499,11 +676,11 @@ struct Editor {
     ai_config: AiConfig,
     config_key_buffer: String,
     pending_ai_request: Option<String>,
+    pending_ai_line_range: Option<(usize, usize)>,
     ai_config_field: usize,
     ai_config_editing: bool,
 
     temp_status: Option<(String, Instant)>,
-    dirty: bool,
 
     undo_stack: Vec<UndoEntry>,
 
@@ -522,21 +699,12 @@ struct Editor {
 impl Editor {
     fn open(filename: String) -> Self {
         let language = detect_language(&filename);
-        let lines = match fs::read_to_string(&filename) {
-            Ok(text) => {
-                let mut out: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-                if out.is_empty() {
-                    out.push(String::new());
-                }
-                out
-            }
-            Err(_) => vec![String::new()],
-        };
+        let buffer = FileBuffer::load(&filename);
 
         Self {
             language,
             filename,
-            lines,
+            buffer,
             cursor_x: 0,
             cursor_y: 0,
             offset_x: 0,
@@ -550,10 +718,10 @@ impl Editor {
             ai_config: load_ai_config(),
             config_key_buffer: String::new(),
             pending_ai_request: None,
+            pending_ai_line_range: None,
             ai_config_field: 0,
             ai_config_editing: false,
             temp_status: None,
-            dirty: false,
             undo_stack: Vec::new(),
             needs_redraw: true,
             force_full_redraw: true,
@@ -696,7 +864,7 @@ impl Editor {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('x') => {
-                    if !self.dirty {
+                    if !self.buffer.dirty {
                         return true;
                     }
                     self.confirm_exit = true;
@@ -742,6 +910,7 @@ impl Editor {
                         self.mode = InputMode::Insert;
                         self.config_key_buffer.clear();
                         self.pending_ai_request = None;
+                        self.pending_ai_line_range = None;
                         self.set_temp_status("API key entry cancelled".to_string(), MESSAGE_STATUS_SECONDS);
                         self.request_redraw();
                     }
@@ -754,15 +923,15 @@ impl Editor {
                         }
 
                         let prov = self.ai_config.provider.clone();
-                        self.ai_config.api_keys.insert(prov.clone(), key_value);
-                        if self.ai_config.save().is_ok() {
+                        if self.save_api_key(&prov, &key_value).is_ok() {
                             self.mode = InputMode::Insert;
                             self.config_key_buffer.clear();
                             self.set_temp_status(format!("{} API key saved", prov), MESSAGE_STATUS_SECONDS);
                             self.request_redraw();
 
                             if let Some(req) = self.pending_ai_request.take() {
-                                self.run_ai_command(req);
+                                let range = self.pending_ai_line_range.take();
+                                self.run_ai_command(req, range);
                             }
                         } else {
                             self.set_temp_status("Failed to save API key".to_string(), MESSAGE_STATUS_SECONDS);
@@ -773,7 +942,7 @@ impl Editor {
                         self.config_key_buffer.pop();
                         self.request_redraw();
                     }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char(c) => {
                         self.config_key_buffer.push(c);
                         self.request_redraw();
                     }
@@ -826,7 +995,13 @@ impl Editor {
                             if !value.is_empty() {
                                 let prov = self.ai_config.provider.clone();
                                 match self.ai_config_field {
-                                    1 => { self.ai_config.api_keys.insert(prov.clone(), value.clone()); }
+                                    1 => {
+                                        if value.is_empty() {
+                                            self.delete_api_key(&prov);
+                                        } else {
+                                            let _ = self.save_api_key(&prov, &value);
+                                        }
+                                    }
                                     2 => { self.ai_config.models.insert(prov, value); }
                                     _ => {}
                                 }
@@ -840,7 +1015,7 @@ impl Editor {
                             self.config_key_buffer.pop();
                             self.request_redraw();
                         }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char(c) => {
                             self.config_key_buffer.push(c);
                             self.request_redraw();
                         }
@@ -886,8 +1061,8 @@ impl Editor {
                                 self.ai_config_editing = true;
                                 self.config_key_buffer.clear();
                                 if self.ai_config_field == 1 {
-                                    if let Some(k) = self.ai_config.api_keys.get(&self.ai_config.provider) {
-                                        self.config_key_buffer = k.clone();
+                                    if let Some(k) = self.get_api_key(&self.ai_config.provider) {
+                                        self.config_key_buffer = k;
                                     }
                                 } else if self.ai_config_field == 2 {
                                     self.config_key_buffer = self.ai_config.active_model();
@@ -922,15 +1097,15 @@ impl Editor {
             }
 
             KeyCode::Down => {
-                if self.cursor_y + 1 < self.lines.len() {
+                if self.cursor_y + 1 < self.buffer.len() {
                     self.cursor_y += 1;
-                } else if self.cursor_y + 1 == self.lines.len()
-                    && !self.lines.last().map_or(true, |l| l.is_empty())
+                } else if self.cursor_y + 1 == self.buffer.len()
+                    && !self.buffer.is_last_empty()
                 {
-                    self.lines.push(String::new());
+                    self.buffer.push(String::new());
                     self.cursor_y += 1;
                 }
-                self.cursor_x = cmp::min(self.cursor_x, self.line_len(self.cursor_y));
+                self.cursor_x = cmp::min(self.cursor_x, self.buffer.char_len(self.cursor_y));
                 self.request_redraw();
             }
 
@@ -939,15 +1114,15 @@ impl Editor {
                     self.cursor_x -= 1;
                 } else if self.cursor_y > 0 {
                     self.cursor_y -= 1;
-                    self.cursor_x = self.line_len(self.cursor_y);
+                    self.cursor_x = self.buffer.char_len(self.cursor_y);
                 }
                 self.request_redraw();
             }
 
             KeyCode::Right => {
-                if self.cursor_x < self.line_len(self.cursor_y) {
+                if self.cursor_x < self.buffer.char_len(self.cursor_y) {
                     self.cursor_x += 1;
-                } else if self.cursor_y + 1 < self.lines.len() {
+                } else if self.cursor_y + 1 < self.buffer.len() {
                     self.cursor_y += 1;
                     self.cursor_x = 0;
                 }
@@ -984,14 +1159,14 @@ impl Editor {
             return false;
         }
         if let Ok(line_num) = raw.parse::<usize>() {
-            if line_num > 0 && line_num <= self.lines.len() {
-                self.cursor_y = line_num - 1; // 1-indexed to 0-indexed
+            if line_num > 0 && line_num <= self.buffer.len() {
+                self.cursor_y = line_num - 1;
                 self.cursor_x = 0;             
                 self.request_full_redraw();
                 self.set_temp_status(format!("Jumped to line {}", line_num), MESSAGE_STATUS_SECONDS);
             } else {
                 self.set_temp_status(
-                    format!("Line {} is out of bounds (max: {})", line_num, self.lines.len()), 
+                    format!("Line {} is out of bounds (max: {})", line_num, self.buffer.len()), 
                     MESSAGE_STATUS_SECONDS
                 );
             }
@@ -1008,7 +1183,7 @@ impl Editor {
                 return false;
             }
             "q" => {
-                if self.dirty {
+                if self.buffer.dirty {
                     self.set_temp_status(
                         "Unsaved changes. Use :q! to quit anyway.".to_string(),
                         MESSAGE_STATUS_SECONDS,
@@ -1099,7 +1274,30 @@ impl Editor {
                 self.request_full_redraw();
                 return false;
             }
-            self.run_ai_command(rest.to_string());
+
+            let mut line_range: Option<(usize, usize)> = None;
+            let mut prompt = rest.to_string();
+
+            if let Some(loc) = rest.find("-l ") {
+                let after_flags = rest[loc + 3..].trim_start();
+                let range_end = after_flags.find(' ').unwrap_or(after_flags.len());
+                let range_str = &after_flags[..range_end];
+                if let Some((a, b)) = range_str.split_once('-') {
+                    if let (Ok(s), Ok(e)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                        if s >= 1 && e >= s {
+                            line_range = Some((s - 1, e - 1));
+                        }
+                    }
+                } else if let Ok(n) = range_str.parse::<usize>() {
+                    if n >= 1 {
+                        line_range = Some((n - 1, n - 1));
+                    }
+                }
+                let after_range = loc + 3 + range_end;
+                prompt = rest[after_range..].trim().to_string();
+            }
+
+            self.run_ai_command(prompt, line_range);
             return false;
         }
 
@@ -1139,7 +1337,7 @@ impl Editor {
         }
     }
 
-    fn run_ai_command(&mut self, request: String) {
+    fn run_ai_command(&mut self, request: String, line_range: Option<(usize, usize)>) {
         let request = if request.trim().is_empty() {
             "Review this file and suggest fixes.".to_string()
         } else {
@@ -1147,10 +1345,11 @@ impl Editor {
         };
 
         let prov = self.ai_config.provider.clone();
-        let has_key = self.ai_config.api_keys.contains_key(&prov);
+        let has_key = self.get_api_key(&prov).is_some();
 
         if !has_key {
             self.pending_ai_request = Some(request);
+            self.pending_ai_line_range = line_range;
             self.mode = InputMode::AwaitAiKey;
             self.config_key_buffer.clear();
             self.set_temp_status(format!("Enter {} API key", prov), MESSAGE_STATUS_SECONDS);
@@ -1162,7 +1361,7 @@ impl Editor {
         self.needs_redraw = true;
         let _ = self.render(&mut stdout());
 
-        match self.call_ai_api(&request) {
+        match self.call_ai_api(&request, line_range) {
             Ok(reply) => {
                 let wrap_width = terminal::size().ok().map(|(w, _)| w as usize).unwrap_or(80);
                 let lines: Vec<String> = reply.lines()
@@ -1188,12 +1387,53 @@ impl Editor {
         }
     }
 
-    fn call_ai_api(&self, request: &str) -> io::Result<String> {
-        let file_text = self.lines.join("\n");
+    fn get_api_key(&self, provider: &str) -> Option<String> {
+        if let Ok(entry) = keyring::Entry::new("van-editor", provider) {
+            if let Ok(key) = entry.get_password() {
+                return Some(key);
+            }
+        }
+        self.ai_config.local_keys.get(provider).cloned()
+    }
+
+    fn save_api_key(&mut self, provider: &str, key: &str) -> io::Result<()> {
+        match keyring::Entry::new("van-editor", provider) {
+            Ok(entry) => {
+                entry.set_password(key)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                self.ai_config.local_keys.remove(provider);
+            }
+            Err(_) => {
+                self.ai_config.local_keys.insert(provider.to_string(), key.to_string());
+            }
+        }
+        let _ = self.ai_config.save();
+        Ok(())
+    }
+
+    fn delete_api_key(&mut self, provider: &str) {
+        if let Ok(entry) = keyring::Entry::new("van-editor", provider) {
+            let _ = entry.delete_credential();
+        }
+        self.ai_config.local_keys.remove(provider);
+        let _ = self.ai_config.save();
+    }
+
+    fn call_ai_api(&self, request: &str, line_range: Option<(usize, usize)>) -> io::Result<String> {
+        let file_text = match line_range {
+            Some((start, end)) => {
+                let end = end.min(self.buffer.len().saturating_sub(1));
+                (start..=end)
+                    .map(|i| self.buffer.get_line(i))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            None => self.buffer.to_file_string(),
+        };
         let system_prompt = "You are a concise coding assistant. Be practical and direct.";
         let user_content = format!("Current file:\n\n{}\n\nUser request:\n{}", file_text, request);
         let prov = &self.ai_config.provider;
-        let api_key = self.ai_config.api_keys.get(prov)
+        let api_key = self.get_api_key(prov)
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no API key for {}", prov)))?;
         let model = self.ai_config.active_model();
         let endpoint = self.ai_config.endpoint();
@@ -1212,7 +1452,7 @@ impl Editor {
                 });
                 let resp = client.post(endpoint)
                     .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-version", &self.ai_config.anthropic_version)
                     .json(&body)
                     .send()
                     .and_then(|r| r.error_for_status())
@@ -1272,7 +1512,7 @@ impl Editor {
             cursor_y: self.cursor_y,
             offset_x: self.offset_x,
             offset_y: self.offset_y,
-            dirty: self.dirty,
+            dirty: self.buffer.dirty,
         });
     }
 
@@ -1283,7 +1523,8 @@ impl Editor {
 
         match entry.action {
             UndoAction::InsertChar { y, x, .. } => {
-                if let Some(line) = self.lines.get_mut(y) {
+                if y < self.buffer.len() {
+                    let line = self.buffer.get_line_mut(y);
                     let byte_idx = char_to_byte_idx(line, x);
                     if byte_idx < line.len() {
                         line.remove(byte_idx);
@@ -1291,28 +1532,27 @@ impl Editor {
                 }
             }
             UndoAction::DeleteChar { y, x, ch } => {
-                if let Some(line) = self.lines.get_mut(y) {
+                if y < self.buffer.len() {
+                    let line = self.buffer.get_line_mut(y);
                     let byte_idx = char_to_byte_idx(line, x);
                     line.insert(byte_idx, ch);
                 }
             }
             UndoAction::InsertNewline { y, x: _, right } => {
-                if y + 1 < self.lines.len() {
-                    let _ = self.lines.remove(y + 1);
-                    if let Some(line) = self.lines.get_mut(y) {
-                        line.push_str(&right);
-                    }
+                if y + 1 < self.buffer.len() {
+                    self.buffer.remove(y + 1);
+                    self.buffer.get_line_mut(y).push_str(&right);
                 }
             }
-            UndoAction::JoinLines { y, x, removed: _removed } => {
-                if y > 0 && y - 1 < self.lines.len() {
-                    let prev = &mut self.lines[y - 1];
+            UndoAction::JoinLines { y, x, .. } => {
+                if y > 0 && y - 1 < self.buffer.len() {
+                    let prev = self.buffer.get_line_mut(y - 1);
                     let right = prev.split_off(x);
-                    self.lines.insert(y, right);
+                    self.buffer.insert(y, right);
                 }
             }
             UndoAction::PasteBlock { saved_lines, .. } => {
-                self.lines = saved_lines;
+                self.buffer.restore_from_snapshot(saved_lines, entry.dirty);
             }
         }
 
@@ -1320,15 +1560,15 @@ impl Editor {
         self.cursor_y = entry.cursor_y;
         self.offset_x = entry.offset_x;
         self.offset_y = entry.offset_y;
-        self.dirty = entry.dirty;
+        self.buffer.dirty = entry.dirty;
         self.request_full_redraw();
         true
     }
 
     fn save(&mut self) -> io::Result<()> {
-        let text = self.lines.join("\n");
+        let text = self.buffer.to_file_string();
         fs::write(&self.filename, text)?;
-        self.dirty = false;
+        self.buffer.dirty = false;
         Ok(())
     }
 
@@ -1364,7 +1604,7 @@ impl Editor {
             }
         }
 
-        let dirty = if self.dirty { "*" } else { "" };
+        let dirty = if self.buffer.dirty { "*" } else { "" };
         format!(
             "{}{} | Ctrl+S Save | Ctrl+F Find | Ctrl+Z Undo | Ctrl+X Exit | Esc Command",
             dirty, self.filename
@@ -1405,7 +1645,7 @@ impl Editor {
             cfg_lines.push(format!("{} Provider: {}", pmark, prov));
 
             let kmark = if self.ai_config_field == 1 && !self.ai_config_editing { ">" } else { " " };
-            let key_disp = if self.ai_config.api_keys.contains_key(prov) { "********" } else { "not set" };
+            let key_disp = if self.get_api_key(prov).is_some() { "********" } else { "not set" };
             cfg_lines.push(format!("{} API Key: {}", kmark, key_disp));
 
             let mmark = if self.ai_config_field == 2 && !self.ai_config_editing { ">" } else { " " };
@@ -1556,8 +1796,8 @@ impl Editor {
 
         for i in 0..text_rows {
             let line_idx = self.offset_y + i;
-            if line_idx < self.lines.len() {
-                rows.push(self.visible_plain_text(&self.lines[line_idx], width));
+            if line_idx < self.buffer.len() {
+                rows.push(self.visible_plain_text(self.buffer.get_line(line_idx), width));
             } else {
                 rows.push(String::new());
             }
@@ -1569,11 +1809,11 @@ impl Editor {
 
     fn draw_visible_line(&self, out: &mut Stdout, row: usize, width: usize) -> io::Result<()> {
         let line_idx = self.offset_y + row;
-        if line_idx >= self.lines.len() {
+        if line_idx >= self.buffer.len() {
             return Ok(());
         }
 
-        let line = &self.lines[line_idx];
+        let line = self.buffer.get_line(line_idx);
         let start_byte = char_to_byte_idx(line, self.offset_x);
         let end_byte = char_to_byte_idx(line, self.offset_x + width);
         let visible = &line[start_byte..end_byte];
@@ -1635,7 +1875,7 @@ impl Editor {
     }
 
     fn line_len(&self, y: usize) -> usize {
-        self.lines[y].chars().count()
+        self.buffer.char_len(y)
     }
 
     fn insert_char(&mut self, c: char) {
@@ -1643,38 +1883,37 @@ impl Editor {
         let x = self.cursor_x;
         self.push_undo(UndoAction::InsertChar { y, x, ch: c });
 
-        let line = &mut self.lines[y];
-        let byte_idx = char_to_byte_idx(line, x);
-        line.insert(byte_idx, c);
+        let byte_idx = char_to_byte_idx(self.buffer.get_line(y), x);
+        self.buffer.get_line_mut(y).insert(byte_idx, c);
         self.cursor_x += 1;
-        self.dirty = true;
+        self.buffer.dirty = true;
     }
 
     fn backspace(&mut self) {
         if self.cursor_x > 0 {
             let y = self.cursor_y;
             let x = self.cursor_x - 1;
-            if let Some(ch) = self.lines[y].chars().nth(x) {
+            if let Some(ch) = self.buffer.get_line(y).chars().nth(x) {
                 self.push_undo(UndoAction::DeleteChar { y, x, ch });
 
-                let line = &mut self.lines[y];
+                let line = self.buffer.get_line_mut(y);
                 let byte_idx = char_to_byte_idx(line, x);
                 line.remove(byte_idx);
                 self.cursor_x -= 1;
-                self.dirty = true;
+                self.buffer.dirty = true;
             }
         } else if self.cursor_y > 0 {
             let y = self.cursor_y;
-            let x = self.line_len(y - 1);
-            let removed = self.lines[y].clone();
+            let x = self.buffer.char_len(y - 1);
+            let removed = self.buffer.get_line(y).to_string();
             self.push_undo(UndoAction::JoinLines { y, x, removed });
 
-            let current = self.lines.remove(y);
+            let current = self.buffer.remove(y);
             self.cursor_y -= 1;
-            let prev_len = self.line_len(self.cursor_y);
-            self.lines[self.cursor_y].push_str(&current);
+            let prev_len = self.buffer.char_len(self.cursor_y);
+            self.buffer.get_line_mut(self.cursor_y).push_str(&current);
             self.cursor_x = prev_len;
-            self.dirty = true;
+            self.buffer.dirty = true;
         }
     }
     fn leading_indent(line: &str) -> usize {
@@ -1725,13 +1964,10 @@ impl Editor {
         let y = self.cursor_y;
         let x = self.cursor_x;
 
-        let split_byte = {
-            let line = &self.lines[y];
-            char_to_byte_idx(line, x)
-        };
-
-        let left = self.lines[y][..split_byte].to_string();
-        let right = self.lines[y][split_byte..].to_string();
+        let line_content = self.buffer.get_line(y);
+        let split_byte = char_to_byte_idx(line_content, x);
+        let left = line_content[..split_byte].to_string();
+        let right = line_content[split_byte..].to_string();
 
         let indent = self.compute_indent(&left, &right);
 
@@ -1741,49 +1977,71 @@ impl Editor {
             right: right.clone(),
         });
 
-        self.lines[y] = left;
+        *self.buffer.get_line_mut(y) = left;
 
         let mut new_line = " ".repeat(indent);
         new_line.push_str(&right);
 
-        self.lines.insert(y + 1, new_line);
+        self.buffer.insert(y + 1, new_line);
         self.cursor_y += 1;
         self.cursor_x = indent;
-        self.dirty = true;
+        self.buffer.dirty = true;
+    }
+
+    fn handle_paste_event(&mut self, text: String) {
+        match self.mode {
+            InputMode::AwaitAiKey => {
+                for c in text.chars().filter(|c| *c != '\r') {
+                    self.config_key_buffer.push(c);
+                }
+                self.request_redraw();
+                return;
+            }
+            InputMode::AiConfig if self.ai_config_editing => {
+                for c in text.chars().filter(|c| *c != '\r') {
+                    self.config_key_buffer.push(c);
+                }
+                self.request_redraw();
+                return;
+            }
+            _ => {}
+        }
+        self.handle_paste(text);
     }
 
     fn handle_paste(&mut self, text: String) {
-        let saved_lines = self.lines.clone();
+        let saved_lines = self.buffer.clone_all();
         let saved_cursor_y = self.cursor_y;
         let saved_cursor_x = self.cursor_x;
-        let saved_dirty = self.dirty;
+        let saved_dirty = self.buffer.dirty;
 
         for ch in text.chars() {
             match ch {
                 '\n' | '\r' => {
                     let y = self.cursor_y;
                     let x = self.cursor_x;
-                    let split_byte = char_to_byte_idx(&self.lines[y], x);
-                    let right = self.lines[y][split_byte..].to_string();
-                    self.lines[y].truncate(split_byte);
-                    self.lines.insert(y + 1, right);
+                    let cur = self.buffer.get_line(y);
+                    let split_byte = char_to_byte_idx(cur, x);
+                    let right = cur[split_byte..].to_string();
+                    self.buffer.get_line_mut(y).truncate(split_byte);
+                    self.buffer.insert(y + 1, right);
                     self.cursor_y += 1;
                     self.cursor_x = 0;
-                    self.dirty = true;
+                    self.buffer.dirty = true;
                 }
                 '\t' => {
                     for _ in 0..4 {
-                        let line = &mut self.lines[self.cursor_y];
+                        let line = self.buffer.get_line_mut(self.cursor_y);
                         line.insert(char_to_byte_idx(line, self.cursor_x), ' ');
                         self.cursor_x += 1;
                     }
-                    self.dirty = true;
+                    self.buffer.dirty = true;
                 }
                 c if !c.is_control() => {
-                    let line = &mut self.lines[self.cursor_y];
+                    let line = self.buffer.get_line_mut(self.cursor_y);
                     line.insert(char_to_byte_idx(line, self.cursor_x), c);
                     self.cursor_x += 1;
-                    self.dirty = true;
+                    self.buffer.dirty = true;
                 }
                 _ => {}
             }
@@ -1800,7 +2058,8 @@ impl Editor {
     }
 
     fn find_first(&self, query: &str) -> Option<(usize, usize)> {
-        for (y, line) in self.lines.iter().enumerate() {
+        for y in 0..self.buffer.len() {
+            let line = self.buffer.get_line(y);
             if let Some(byte_idx) = line.find(query) {
                 let char_idx = line[..byte_idx].chars().count();
                 return Some((y, char_idx));
