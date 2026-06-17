@@ -392,6 +392,7 @@ fn main() -> io::Result<()> {
                 println!("  :line   Jump to line");
                 println!("  :chmod  Make .sh file executable");
                 println!("  :syntax on/off  Toggle syntax highlighting");
+                println!("  :lines on/off    Toggle line numbers");
                 println!("  :!cmd   Run shell command");
                 println!("  :ai <prompt>   Ask AI (Groq/OpenAI/Anthropic/Gemini/OpenRouter/OpenCode Zen)");
                 println!("  :ai -l N-M <prompt>  Ask AI about specific lines (1-indexed)");
@@ -694,6 +695,7 @@ struct Editor {
     ai_scroll: usize,
 
     syntax_highlight: bool,
+    show_line_numbers: bool,
 }
 
 impl Editor {
@@ -731,6 +733,7 @@ impl Editor {
             ai_output: None,
             ai_scroll: 0,
             syntax_highlight: true,
+            show_line_numbers: false,
         } 
     }
 
@@ -896,6 +899,13 @@ impl Editor {
                     } else {
                         self.set_temp_status("Nothing to undo".to_string(), MESSAGE_STATUS_SECONDS);
                     }
+                    self.request_full_redraw();
+                }
+
+                KeyCode::Char('l') => {
+                    self.show_line_numbers = !self.show_line_numbers;
+                    let status = if self.show_line_numbers { "on" } else { "off" };
+                    self.set_temp_status(format!("Line numbers {}", status), MESSAGE_STATUS_SECONDS);
                     self.request_full_redraw();
                 }
 
@@ -1220,6 +1230,25 @@ impl Editor {
             "syntax off" | "syntax disable" => {
                 self.syntax_highlight = false;
                 self.set_temp_status("Syntax highlighting disabled".to_string(), MESSAGE_STATUS_SECONDS);
+                self.request_full_redraw();
+                return false;
+            }
+            "lines" => {
+                self.show_line_numbers = !self.show_line_numbers;
+                let status = if self.show_line_numbers { "on" } else { "off" };
+                self.set_temp_status(format!("Line numbers {}", status), MESSAGE_STATUS_SECONDS);
+                self.request_full_redraw();
+                return false;
+            }
+            "lines on" | "lines enable" => {
+                self.show_line_numbers = true;
+                self.set_temp_status("Line numbers enabled".to_string(), MESSAGE_STATUS_SECONDS);
+                self.request_full_redraw();
+                return false;
+            }
+            "lines off" | "lines disable" => {
+                self.show_line_numbers = false;
+                self.set_temp_status("Line numbers disabled".to_string(), MESSAGE_STATUS_SECONDS);
                 self.request_full_redraw();
                 return false;
             }
@@ -1606,13 +1635,14 @@ impl Editor {
 
         let dirty = if self.buffer.dirty { "*" } else { "" };
         format!(
-            "{}{} | Ctrl+S Save | Ctrl+F Find | Ctrl+Z Undo | Ctrl+X Exit | Esc Command",
+            "{}{} | Ctrl+S Save | Ctrl+F Find | Ctrl+Z Undo | Ctrl+L Lines | Ctrl+X Exit | Esc Command",
             dirty, self.filename
         )
     }
 
     fn update_scroll(&mut self, width: usize, height: usize) {
         let text_rows = height.saturating_sub(1);
+        let text_width = width.saturating_sub(self.gutter_width());
 
         if self.cursor_y < self.offset_y {
             self.offset_y = self.cursor_y;
@@ -1622,8 +1652,8 @@ impl Editor {
 
         if self.cursor_x < self.offset_x {
             self.offset_x = self.cursor_x;
-        } else if self.cursor_x >= self.offset_x + width {
-            self.offset_x = self.cursor_x.saturating_sub(width.saturating_sub(1));
+        } else if self.cursor_x >= self.offset_x + text_width {
+            self.offset_x = self.cursor_x.saturating_sub(text_width.saturating_sub(1));
         }
     }
 
@@ -1761,10 +1791,12 @@ impl Editor {
         }
 
         if height > 0 {
-            let cx = self
+            let gutter = self.gutter_width() as u16;
+            let effective_width = width.saturating_sub(gutter as usize);
+            let cx = gutter + self
                 .cursor_x
                 .saturating_sub(self.offset_x)
-                .min(width.saturating_sub(1)) as u16;
+                .min(effective_width.saturating_sub(1)) as u16;
             let cy = self
                 .cursor_y
                 .saturating_sub(self.offset_y)
@@ -1793,11 +1825,19 @@ impl Editor {
 
     fn build_rows(&self, width: usize, text_rows: usize) -> Vec<String> {
         let mut rows = Vec::with_capacity(text_rows + 1);
+        let gutter = self.gutter_width();
+        let text_width = width.saturating_sub(gutter);
 
         for i in 0..text_rows {
             let line_idx = self.offset_y + i;
             if line_idx < self.buffer.len() {
-                rows.push(self.visible_plain_text(self.buffer.get_line(line_idx), width));
+                let mut line = self.visible_plain_text(self.buffer.get_line(line_idx), text_width);
+                if gutter > 0 {
+                    let lineno = line_idx + 1;
+                    let gutter_str = format!("{:>width$} ", lineno, width = gutter - 1);
+                    line.insert_str(0, &gutter_str);
+                }
+                rows.push(line);
             } else {
                 rows.push(String::new());
             }
@@ -1813,9 +1853,18 @@ impl Editor {
             return Ok(());
         }
 
+        let gutter = self.gutter_width();
+        let text_width = width.saturating_sub(gutter);
+
+        if gutter > 0 {
+            let lineno = line_idx + 1;
+            let gutter_str = format!("{:>width$} ", lineno, width = gutter - 1);
+            queue!(out, Print(&gutter_str))?;
+        }
+
         let line = self.buffer.get_line(line_idx);
         let start_byte = char_to_byte_idx(line, self.offset_x);
-        let end_byte = char_to_byte_idx(line, self.offset_x + width);
+        let end_byte = char_to_byte_idx(line, self.offset_x + text_width);
         let visible = &line[start_byte..end_byte];
 
         if self.search_highlight.is_empty() && self.syntax_highlight {
@@ -1876,6 +1925,18 @@ impl Editor {
 
     fn line_len(&self, y: usize) -> usize {
         self.buffer.char_len(y)
+    }
+
+    fn gutter_width(&self) -> usize {
+        if !self.show_line_numbers {
+            return 0;
+        }
+        let total = self.buffer.len();
+        if total <= 1 {
+            2 // "1 " minimum space even for single-line files
+        } else {
+            total.to_string().len() + 1
+        }
     }
 
     fn insert_char(&mut self, c: char) {
