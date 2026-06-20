@@ -19,6 +19,14 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VAN_LOGO: &[&str] = &[
+    "__      __",
+    "\\ \\    / /",
+    " \\ \\  / /_ _ _ __",
+    "  \\ \\/ / _` | '_ \\",
+    "   \\  / (_| | | | |",
+    "    \\/ \\__,_|_| |_|",
+];
 const SEARCH_STATUS_SECONDS: u64 = 5;
 const MESSAGE_STATUS_SECONDS: u64 = 3;
 const AI_STATUS_SECONDS: u64 = 9;
@@ -404,9 +412,9 @@ fn main() -> io::Result<()> {
     }
 
     let filename = if args.len() > 1 {
-        args[1].clone()
+        Some(args[1].clone())
     } else {
-        "untitled.txt".to_string()
+        None
     };
 
     let mut out = stdout();
@@ -424,8 +432,10 @@ fn main() -> io::Result<()> {
                         break;
                     }
                 }
-                Event::Resize(_, _) => {
-                    editor.request_full_redraw();
+                Event::Resize(w, h) => {
+                    if editor.handle_resize(w, h) {
+                        editor.request_full_redraw();
+                    }
                 }
                 Event::Paste(text) => {
                     editor.handle_paste_event(text);
@@ -510,6 +520,13 @@ enum InputMode {
     Command,
     AwaitAiKey,
     AiConfig,
+    FilePicker,
+}
+
+struct FilePickerEntry {
+    name: String,
+    display: String,
+    is_dir: bool,
 }
 
 #[derive(Clone)]
@@ -696,16 +713,24 @@ struct Editor {
 
     syntax_highlight: bool,
     show_line_numbers: bool,
+
+    file_picker_entries: Vec<FilePickerEntry>,
+    file_picker_selection: usize,
+    file_picker_current_dir: PathBuf,
 }
 
 impl Editor {
-    fn open(filename: String) -> Self {
-        let language = detect_language(&filename);
-        let buffer = FileBuffer::load(&filename);
+    fn open(filename: Option<String>) -> Self {
+        let (fname, mode) = match filename {
+            Some(f) => (f, InputMode::Insert),
+            None => (String::new(), InputMode::FilePicker),
+        };
+        let language = if !fname.is_empty() { detect_language(&fname) } else { Language::PlainText };
+        let buffer = if !fname.is_empty() { FileBuffer::load(&fname) } else { FileBuffer::new_empty() };
 
-        Self {
+        let mut editor = Self {
             language,
-            filename,
+            filename: fname,
             buffer,
             cursor_x: 0,
             cursor_y: 0,
@@ -715,7 +740,7 @@ impl Editor {
             search_highlight: String::new(),
             in_search: false,
             confirm_exit: false,
-            mode: InputMode::Insert,
+            mode,
             command_buffer: String::new(),
             ai_config: load_ai_config(),
             config_key_buffer: String::new(),
@@ -734,7 +759,17 @@ impl Editor {
             ai_scroll: 0,
             syntax_highlight: true,
             show_line_numbers: false,
-        } 
+            file_picker_entries: Vec::new(),
+            file_picker_selection: 0,
+            file_picker_current_dir: PathBuf::new(),
+        };
+
+        if editor.mode == InputMode::FilePicker {
+            editor.file_picker_current_dir = env::current_dir().unwrap_or_default();
+            editor.refresh_file_picker();
+        }
+
+        editor
     }
 
     fn request_redraw(&mut self) {
@@ -744,6 +779,64 @@ impl Editor {
     fn request_full_redraw(&mut self) {
         self.needs_redraw = true;
         self.force_full_redraw = true;
+    }
+
+    fn handle_resize(&mut self, w: u16, h: u16) -> bool {
+        let changed = self.last_size != (w, h);
+        if changed {
+            self.request_redraw();
+        }
+        changed
+    }
+
+    fn refresh_file_picker(&mut self) {
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = fs::read_dir(&self.file_picker_current_dir) {
+            for entry in read_dir {
+                if let Ok(entry) = entry {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let display = if is_dir { format!("{}/", name) } else { name.clone() };
+                    entries.push(FilePickerEntry { name, display, is_dir });
+                }
+            }
+        }
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.display.cmp(&b.display)));
+        self.file_picker_entries = entries;
+        self.file_picker_selection = 0;
+    }
+
+    fn open_file_picker_selection(&mut self) {
+        let Some(entry) = self.file_picker_entries.get(self.file_picker_selection) else { return };
+        let path = self.file_picker_current_dir.join(&entry.name);
+        if entry.is_dir {
+            self.file_picker_current_dir = path;
+            self.refresh_file_picker();
+            self.request_full_redraw();
+        } else {
+            let path_str = path.to_string_lossy().to_string();
+            self.filename = path_str.clone();
+            self.language = detect_language(&path_str);
+            self.buffer = FileBuffer::load(&path_str);
+            self.mode = InputMode::Insert;
+            self.cursor_x = 0;
+            self.cursor_y = 0;
+            self.offset_x = 0;
+            self.offset_y = 0;
+            self.request_full_redraw();
+        }
+    }
+
+    fn go_to_parent_dir(&mut self) {
+        if let Some(parent) = self.file_picker_current_dir.parent() {
+            if parent.as_os_str().is_empty() {
+                self.file_picker_current_dir = PathBuf::from("/");
+            } else {
+                self.file_picker_current_dir = parent.to_path_buf();
+            }
+            self.refresh_file_picker();
+            self.request_full_redraw();
+        }
     }
 
     fn needs_redraw(&self) -> bool {
@@ -1087,6 +1180,34 @@ impl Editor {
             }
 
             InputMode::Insert => {}
+            InputMode::FilePicker => {}
+        }
+
+        if self.mode == InputMode::FilePicker {
+            match key.code {
+                KeyCode::Up => {
+                    self.file_picker_selection = self.file_picker_selection.saturating_sub(1);
+                    self.request_redraw();
+                }
+                KeyCode::Down => {
+                    let max = self.file_picker_entries.len().saturating_sub(1);
+                    self.file_picker_selection = cmp::min(self.file_picker_selection + 1, max);
+                    self.request_redraw();
+                }
+                KeyCode::Enter => {
+                    self.open_file_picker_selection();
+                }
+                KeyCode::Backspace => {
+                    self.go_to_parent_dir();
+                }
+                KeyCode::Esc => {
+                    self.mode = InputMode::Insert;
+                    self.set_temp_status("Opened new buffer".to_string(), MESSAGE_STATUS_SECONDS);
+                    self.request_full_redraw();
+                }
+                _ => {}
+            }
+            return false;
         }
 
         match key.code {
@@ -1713,6 +1834,78 @@ impl Editor {
             return Ok(());
         }
 
+        if self.mode == InputMode::FilePicker {
+            queue!(out, Clear(ClearType::All), cursor::Hide)?;
+
+            let dir_str = self.file_picker_current_dir.to_string_lossy().to_string();
+            let header = format!(" {}", dir_str);
+            let status = "↑/↓ navigate  Enter open  Backspace parent  Esc new buffer";
+
+            let entries_to_show = cmp::min(self.file_picker_entries.len(), height.saturating_sub(9));
+            let empty_msg = if self.file_picker_entries.is_empty() { " (empty directory)" } else { "" };
+            let max_entry_width = self.file_picker_entries.iter()
+                .map(|e| e.display.len() + 2).max().unwrap_or(0);
+
+            let logo_width = VAN_LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+            let content_width = cmp::min(
+                cmp::max(
+                    cmp::max(logo_width, header.chars().count()),
+                    cmp::max(max_entry_width + empty_msg.len(), status.chars().count()),
+                ),
+                width,
+            );
+
+            let logo_height = VAN_LOGO.len();
+            let box_height = logo_height + 1 + 1 + entries_to_show + 1;
+            let top_margin = height.saturating_sub(box_height) / 2;
+            let left_margin = width.saturating_sub(content_width) / 2;
+
+            let left_pad = content_width.saturating_sub(logo_width) / 2;
+            let logo_indent = " ".repeat(left_pad);
+            for (i, logo_line) in VAN_LOGO.iter().enumerate() {
+                let display = format!("{}{}", logo_indent, logo_line);
+                let line_padded = pad_to_width(&display, content_width);
+                queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
+                    SetForegroundColor(Color::Blue), Print(&line_padded), ResetColor)?;
+            }
+
+            let header_padded = pad_to_width(&truncate_to_width(&header, content_width), content_width);
+            let header_y = top_margin + logo_height + 1;
+            queue!(out, cursor::MoveTo(left_margin as u16, header_y as u16),
+                SetAttribute(Attribute::Reverse), Print(&header_padded), SetAttribute(Attribute::Reset))?;
+
+            if self.file_picker_entries.is_empty() {
+                let line_padded = pad_to_width(&truncate_to_width(empty_msg, content_width), content_width);
+                queue!(out, cursor::MoveTo(left_margin as u16, (header_y + 1) as u16), Print(&line_padded))?;
+            } else {
+                for i in 0..entries_to_show {
+                    let entry = &self.file_picker_entries[i];
+                    let prefix = if i == self.file_picker_selection { " >" } else { "  " };
+                    let line = format!("{}{}", prefix, entry.display);
+                    let line_padded = pad_to_width(&truncate_to_width(&line, content_width), content_width);
+                    let y = (header_y + 1 + i) as u16;
+                    if i == self.file_picker_selection {
+                        queue!(out, cursor::MoveTo(left_margin as u16, y),
+                            SetAttribute(Attribute::Reverse),
+                            Print(&line_padded),
+                            SetAttribute(Attribute::Reset))?;
+                    } else {
+                        queue!(out, cursor::MoveTo(left_margin as u16, y), Print(&line_padded))?;
+                    }
+                }
+            }
+
+            let status_padded = pad_to_width(&truncate_to_width(status, content_width), content_width);
+            let status_y = (header_y + 1 + entries_to_show) as u16;
+            queue!(out, cursor::MoveTo(left_margin as u16, status_y),
+                SetAttribute(Attribute::Reverse), Print(&status_padded), SetAttribute(Attribute::Reset))?;
+
+            out.flush()?;
+            self.needs_redraw = false;
+            self.force_full_redraw = false;
+            return Ok(());
+        }
+
         if let Some(ai_lines) = &self.ai_output {
             queue!(out, Clear(ClearType::All))?;
 
@@ -1801,7 +1994,7 @@ impl Editor {
                 .cursor_y
                 .saturating_sub(self.offset_y)
                 .min(text_rows.saturating_sub(1)) as u16;
-            queue!(out, cursor::MoveTo(cx, cy))?;
+            queue!(out, cursor::Show, cursor::MoveTo(cx, cy))?;
         }
 
         out.flush()?;
@@ -2063,6 +2256,9 @@ impl Editor {
                     self.config_key_buffer.push(c);
                 }
                 self.request_redraw();
+                return;
+            }
+            InputMode::FilePicker => {
                 return;
             }
             _ => {}
