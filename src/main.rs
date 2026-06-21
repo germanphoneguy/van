@@ -2024,7 +2024,7 @@ impl Editor {
                 indent
             }
 
-            Language::PlainText | Language::Shell => base,
+            Language::PlainText | Language::Shell | Language::Markdown => base,
         }
     }
     fn insert_newline(&mut self) {
