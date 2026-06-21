@@ -21,6 +21,11 @@ cargo install --path .
 ```bash
 van [FILENAME]
 ```
+Or to open the file picker menu:
+
+```bash
+van
+```
 
 ## Controls
 
