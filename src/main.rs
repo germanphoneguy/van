@@ -336,10 +336,32 @@ enum InputMode {
     FilePicker,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilePickerView {
+    Simple,
+    Manager,
+}
+
 struct FilePickerEntry {
     name: String,
     display: String,
     is_dir: bool,
+    size: u64,
+}
+
+enum PendingFileOp {
+    Copy { source: PathBuf },
+    Move { source: PathBuf },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptState {
+    None,
+    ConfirmDelete { entry_idx: usize },
+    ConfirmOverwrite { path: usize, is_move: bool },
+    InputRename { entry_idx: usize },
+    InputCreateFile,
+    InputCreateDir,
 }
 
 #[derive(Clone)]
@@ -530,6 +552,11 @@ struct Editor {
     file_picker_entries: Vec<FilePickerEntry>,
     file_picker_selection: usize,
     file_picker_current_dir: PathBuf,
+    file_picker_view: FilePickerView,
+    prompt_state: PromptState,
+    prompt_input: String,
+    pending_file_op: Option<PendingFileOp>,
+    show_hidden: bool,
 }
 
 impl Editor {
@@ -575,6 +602,11 @@ impl Editor {
             file_picker_entries: Vec::new(),
             file_picker_selection: 0,
             file_picker_current_dir: PathBuf::new(),
+            file_picker_view: FilePickerView::Simple,
+            prompt_state: PromptState::None,
+            prompt_input: String::new(),
+            pending_file_op: None,
+            show_hidden: false,
         };
 
         if editor.mode == InputMode::FilePicker {
@@ -608,9 +640,11 @@ impl Editor {
             for entry in read_dir {
                 if let Ok(entry) = entry {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    if !self.show_hidden && name.starts_with('.') { continue; }
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                     let display = if is_dir { format!("{}/", name) } else { name.clone() };
-                    entries.push(FilePickerEntry { name, display, is_dir });
+                    entries.push(FilePickerEntry { name, display, is_dir, size });
                 }
             }
         }
@@ -624,6 +658,8 @@ impl Editor {
         let path = self.file_picker_current_dir.join(&entry.name);
         if entry.is_dir {
             self.file_picker_current_dir = path;
+            self.prompt_state = PromptState::None;
+            self.prompt_input.clear();
             self.refresh_file_picker();
             self.request_full_redraw();
         } else {
@@ -647,9 +683,333 @@ impl Editor {
             } else {
                 self.file_picker_current_dir = parent.to_path_buf();
             }
+            self.prompt_state = PromptState::None;
+            self.prompt_input.clear();
             self.refresh_file_picker();
             self.request_full_redraw();
         }
+    }
+
+    fn handle_file_picker_key(&mut self, key: KeyEvent) -> bool {
+        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match self.prompt_state {
+            PromptState::ConfirmDelete { entry_idx } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let entry = &self.file_picker_entries[entry_idx];
+                        let path = self.file_picker_current_dir.join(&entry.name);
+                        let result = if entry.is_dir { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+                        match result {
+                            Ok(_) => self.set_temp_status(format!("Deleted: {}", entry.name), MESSAGE_STATUS_SECONDS),
+                            Err(e) => self.set_temp_status(format!("Delete failed: {}", e), MESSAGE_STATUS_SECONDS),
+                        }
+                        self.prompt_state = PromptState::None;
+                        self.refresh_file_picker();
+                        self.request_full_redraw();
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.prompt_state = PromptState::None;
+                        self.set_temp_status("Delete cancelled".to_string(), MESSAGE_STATUS_SECONDS);
+                        self.request_redraw();
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            PromptState::ConfirmOverwrite { path: idx, is_move } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let target = self.file_picker_current_dir.join(&self.file_picker_entries[idx].name);
+                        if let Some(op) = self.pending_file_op.take() {
+                            let (src, op_name) = match &op {
+                                PendingFileOp::Copy { source } => (source.clone(), "Copy"),
+                                PendingFileOp::Move { source } => (source.clone(), "Move"),
+                            };
+                            let result = if is_move { fs::rename(&src, &target) } else { fs::copy(&src, &target).map(|_| ()) };
+                            match result {
+                                Ok(_) => self.set_temp_status(format!("{}: {} done", op_name, src.file_name().unwrap_or_default().to_string_lossy()), MESSAGE_STATUS_SECONDS),
+                                Err(e) => self.set_temp_status(format!("{} failed: {}", op_name, e), MESSAGE_STATUS_SECONDS),
+                            }
+                        }
+                        self.prompt_state = PromptState::None;
+                        self.pending_file_op = None;
+                        self.refresh_file_picker();
+                        self.request_full_redraw();
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.prompt_state = PromptState::None;
+                        self.set_temp_status("Overwrite cancelled".to_string(), MESSAGE_STATUS_SECONDS);
+                        self.request_redraw();
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            PromptState::InputRename { .. } | PromptState::InputCreateFile | PromptState::InputCreateDir => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.prompt_state = PromptState::None;
+                        self.prompt_input.clear();
+                        self.set_temp_status("Cancelled".to_string(), MESSAGE_STATUS_SECONDS);
+                        self.request_redraw();
+                    }
+                    KeyCode::Enter => {
+                        let input = self.prompt_input.trim().to_string();
+                        if input.is_empty() {
+                            self.set_temp_status("Name cannot be empty".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.request_redraw();
+                            return false;
+                        }
+                        match self.prompt_state {
+                            PromptState::InputRename { entry_idx } => {
+                                let entry = &self.file_picker_entries[entry_idx];
+                                let src = self.file_picker_current_dir.join(&entry.name);
+                                let dst = self.file_picker_current_dir.join(&input);
+                                match fs::rename(&src, &dst) {
+                                    Ok(_) => self.set_temp_status(format!("Renamed to: {}", input), MESSAGE_STATUS_SECONDS),
+                                    Err(e) => self.set_temp_status(format!("Rename failed: {}", e), MESSAGE_STATUS_SECONDS),
+                                }
+                            }
+                            PromptState::InputCreateFile => {
+                                let path = self.file_picker_current_dir.join(&input);
+                                match fs::File::create(&path) {
+                                    Ok(_) => self.set_temp_status(format!("Created: {}", input), MESSAGE_STATUS_SECONDS),
+                                    Err(e) => self.set_temp_status(format!("Create failed: {}", e), MESSAGE_STATUS_SECONDS),
+                                }
+                            }
+                            PromptState::InputCreateDir => {
+                                let path = self.file_picker_current_dir.join(&input);
+                                match fs::create_dir(&path) {
+                                    Ok(_) => self.set_temp_status(format!("Created dir: {}", input), MESSAGE_STATUS_SECONDS),
+                                    Err(e) => self.set_temp_status(format!("Create dir failed: {}", e), MESSAGE_STATUS_SECONDS),
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.prompt_state = PromptState::None;
+                        self.prompt_input.clear();
+                        self.refresh_file_picker();
+                        self.request_full_redraw();
+                    }
+                    KeyCode::Backspace => {
+                        self.prompt_input.pop();
+                        self.request_redraw();
+                    }
+                    KeyCode::Char(c) if !is_ctrl => {
+                        self.prompt_input.push(c);
+                        self.request_redraw();
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            PromptState::None => {}
+        }
+
+        match self.file_picker_view {
+            FilePickerView::Simple => {
+                match key.code {
+                    KeyCode::Tab => {
+                        self.file_picker_view = FilePickerView::Manager;
+                        self.request_full_redraw();
+                    }
+                    KeyCode::Up => {
+                        self.file_picker_selection = self.file_picker_selection.saturating_sub(1);
+                        self.request_redraw();
+                    }
+                    KeyCode::Down => {
+                        let max = self.file_picker_entries.len().saturating_sub(1);
+                        self.file_picker_selection = cmp::min(self.file_picker_selection + 1, max);
+                        self.request_redraw();
+                    }
+                    KeyCode::Enter => {
+                        self.open_file_picker_selection();
+                    }
+                    KeyCode::Backspace => {
+                        self.go_to_parent_dir();
+                    }
+                    KeyCode::Esc => {
+                        self.mode = InputMode::Insert;
+                        self.set_temp_status("Opened new buffer".to_string(), MESSAGE_STATUS_SECONDS);
+                        self.request_full_redraw();
+                    }
+                    _ => {}
+                }
+            }
+            FilePickerView::Manager => {
+                if let Some(op) = &self.pending_file_op {
+                    match key.code {
+                        KeyCode::Char('x') | KeyCode::Char('X') => {
+                            let src = match op {
+                                PendingFileOp::Copy { source } => source.clone(),
+                                PendingFileOp::Move { source } => source.clone(),
+                            };
+                            let target = self.file_picker_current_dir.join(
+                                src.file_name().unwrap()
+                            );
+                            if target.exists() {
+                                let idx = self.file_picker_entries.iter().position(|e| {
+                                    self.file_picker_current_dir.join(&e.name) == target
+                                });
+                                if let Some(i) = idx {
+                                    self.prompt_state = PromptState::ConfirmOverwrite { path: i, is_move: matches!(op, PendingFileOp::Move { .. }) };
+                                    self.request_redraw();
+                                    return false;
+                                }
+                            }
+                            let op_name = match &self.pending_file_op {
+                                Some(PendingFileOp::Copy { .. }) => { self.pending_file_op = None; "Copy" }
+                                Some(PendingFileOp::Move { .. }) => { self.pending_file_op = None; "Move" }
+                                _ => unreachable!(),
+                            };
+                            let is_move = op_name == "Move";
+                            let result = if is_move { fs::rename(&src, &target) } else { fs::copy(&src, &target).map(|_| ()) };
+                            match result {
+                                Ok(_) => self.set_temp_status(format!("{}: {} done", op_name, src.file_name().unwrap_or_default().to_string_lossy()), MESSAGE_STATUS_SECONDS),
+                                Err(e) => self.set_temp_status(format!("{} failed: {}", op_name, e), MESSAGE_STATUS_SECONDS),
+                            }
+                            self.refresh_file_picker();
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Esc | KeyCode::Tab => {
+                            self.pending_file_op = None;
+                            self.set_temp_status("Operation cancelled".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.file_picker_view = FilePickerView::Simple;
+                            self.request_redraw();
+                        }
+                        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Backspace => {
+                            match key.code {
+                                KeyCode::Up => {
+                                    self.file_picker_selection = self.file_picker_selection.saturating_sub(1);
+                                    self.request_redraw();
+                                }
+                                KeyCode::Down => {
+                                    let max = self.file_picker_entries.len().saturating_sub(1);
+                                    self.file_picker_selection = cmp::min(self.file_picker_selection + 1, max);
+                                    self.request_redraw();
+                                }
+                                KeyCode::Enter => {
+                                    self.open_file_picker_selection();
+                                }
+                                KeyCode::Backspace => {
+                                    self.go_to_parent_dir();
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Tab => {
+                            self.file_picker_view = FilePickerView::Simple;
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Up => {
+                            self.file_picker_selection = self.file_picker_selection.saturating_sub(1);
+                            self.request_redraw();
+                        }
+                        KeyCode::Down => {
+                            let max = self.file_picker_entries.len().saturating_sub(1);
+                            self.file_picker_selection = cmp::min(self.file_picker_selection + 1, max);
+                            self.request_redraw();
+                        }
+                        KeyCode::Enter => {
+                            self.open_file_picker_selection();
+                        }
+                        KeyCode::Backspace => {
+                            self.go_to_parent_dir();
+                        }
+                        KeyCode::Esc => {
+                            self.file_picker_view = FilePickerView::Simple;
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Char('h') => {
+                            self.show_hidden = !self.show_hidden;
+                            self.refresh_file_picker();
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Char('r') => {
+                            self.refresh_file_picker();
+                            self.set_temp_status("Refreshed".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Char('n') => {
+                            self.prompt_state = PromptState::InputCreateFile;
+                            self.prompt_input.clear();
+                            self.set_temp_status("New file name:".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.request_redraw();
+                        }
+                        KeyCode::Char('N') if !is_ctrl => {
+                            self.prompt_state = PromptState::InputCreateDir;
+                            self.prompt_input.clear();
+                            self.set_temp_status("New directory name:".to_string(), MESSAGE_STATUS_SECONDS);
+                            self.request_redraw();
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            if self.file_picker_entries.is_empty() {
+                                self.set_temp_status("Nothing selected".to_string(), MESSAGE_STATUS_SECONDS);
+                                self.request_redraw();
+                            } else {
+                                let name = self.file_picker_entries[self.file_picker_selection].name.clone();
+                                self.prompt_state = PromptState::ConfirmDelete { entry_idx: self.file_picker_selection };
+                                self.set_temp_status(format!("Delete '{}'? (y/n)", name), MESSAGE_STATUS_SECONDS);
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Char('R') => {
+                            if self.file_picker_entries.is_empty() {
+                                self.set_temp_status("Nothing selected".to_string(), MESSAGE_STATUS_SECONDS);
+                                self.request_redraw();
+                            } else {
+                                let name = self.file_picker_entries[self.file_picker_selection].name.clone();
+                                self.prompt_state = PromptState::InputRename { entry_idx: self.file_picker_selection };
+                                self.prompt_input = name.clone();
+                                self.set_temp_status(format!("Rename '{}' to:", name), MESSAGE_STATUS_SECONDS);
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Char('c') if !is_ctrl => {
+                            if self.file_picker_entries.is_empty() {
+                                self.set_temp_status("Nothing selected".to_string(), MESSAGE_STATUS_SECONDS);
+                                self.request_redraw();
+                            } else {
+                                let path = self.file_picker_current_dir.join(&self.file_picker_entries[self.file_picker_selection].name);
+                                if path.is_dir() {
+                                    self.set_temp_status("Cannot copy a directory (file only)".to_string(), MESSAGE_STATUS_SECONDS);
+                                    self.request_redraw();
+                                } else {
+                                    let name = self.file_picker_entries[self.file_picker_selection].name.clone();
+                                    self.pending_file_op = Some(PendingFileOp::Copy { source: path });
+                                    self.set_temp_status(format!("Copy: '{}' — navigate to target, press x", name), MESSAGE_STATUS_SECONDS);
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            if self.file_picker_entries.is_empty() {
+                                self.set_temp_status("Nothing selected".to_string(), MESSAGE_STATUS_SECONDS);
+                                self.request_redraw();
+                            } else {
+                                let path = self.file_picker_current_dir.join(&self.file_picker_entries[self.file_picker_selection].name);
+                                if path.is_dir() {
+                                    self.set_temp_status("Cannot move a directory (file only)".to_string(), MESSAGE_STATUS_SECONDS);
+                                    self.request_redraw();
+                                } else {
+                                    let name = self.file_picker_entries[self.file_picker_selection].name.clone();
+                                    self.pending_file_op = Some(PendingFileOp::Move { source: path });
+                                    self.set_temp_status(format!("Move: '{}' — navigate to target, press x", name), MESSAGE_STATUS_SECONDS);
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn needs_redraw(&self) -> bool {
@@ -997,30 +1357,7 @@ impl Editor {
         }
 
         if self.mode == InputMode::FilePicker {
-            match key.code {
-                KeyCode::Up => {
-                    self.file_picker_selection = self.file_picker_selection.saturating_sub(1);
-                    self.request_redraw();
-                }
-                KeyCode::Down => {
-                    let max = self.file_picker_entries.len().saturating_sub(1);
-                    self.file_picker_selection = cmp::min(self.file_picker_selection + 1, max);
-                    self.request_redraw();
-                }
-                KeyCode::Enter => {
-                    self.open_file_picker_selection();
-                }
-                KeyCode::Backspace => {
-                    self.go_to_parent_dir();
-                }
-                KeyCode::Esc => {
-                    self.mode = InputMode::Insert;
-                    self.set_temp_status("Opened new buffer".to_string(), MESSAGE_STATUS_SECONDS);
-                    self.request_full_redraw();
-                }
-                _ => {}
-            }
-            return false;
+            return self.handle_file_picker_key(key);
         }
 
         match key.code {
@@ -1651,67 +1988,15 @@ impl Editor {
             queue!(out, Clear(ClearType::All), cursor::Hide)?;
 
             let dir_str = self.file_picker_current_dir.to_string_lossy().to_string();
-            let header = format!(" {}", dir_str);
-            let status = "↑/↓ navigate  Enter open  Backspace parent  Esc new buffer";
 
-            let entries_to_show = cmp::min(self.file_picker_entries.len(), height.saturating_sub(9));
-            let empty_msg = if self.file_picker_entries.is_empty() { " (empty directory)" } else { "" };
-            let max_entry_width = self.file_picker_entries.iter()
-                .map(|e| e.display.len() + 2).max().unwrap_or(0);
-
-            let logo_width = VAN_LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-            let content_width = cmp::min(
-                cmp::max(
-                    cmp::max(logo_width, header.chars().count()),
-                    cmp::max(max_entry_width + empty_msg.len(), status.chars().count()),
-                ),
-                width,
-            );
-
-            let logo_height = VAN_LOGO.len();
-            let box_height = logo_height + 1 + 1 + entries_to_show + 1;
-            let top_margin = height.saturating_sub(box_height) / 2;
-            let left_margin = width.saturating_sub(content_width) / 2;
-
-            let left_pad = content_width.saturating_sub(logo_width) / 2;
-            let logo_indent = " ".repeat(left_pad);
-            for (i, logo_line) in VAN_LOGO.iter().enumerate() {
-                let display = format!("{}{}", logo_indent, logo_line);
-                let line_padded = pad_to_width(&display, content_width);
-                queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
-                    SetForegroundColor(Color::Blue), Print(&line_padded), ResetColor)?;
-            }
-
-            let header_padded = pad_to_width(&truncate_to_width(&header, content_width), content_width);
-            let header_y = top_margin + logo_height + 1;
-            queue!(out, cursor::MoveTo(left_margin as u16, header_y as u16),
-                SetAttribute(Attribute::Reverse), Print(&header_padded), SetAttribute(Attribute::Reset))?;
-
-            if self.file_picker_entries.is_empty() {
-                let line_padded = pad_to_width(&truncate_to_width(empty_msg, content_width), content_width);
-                queue!(out, cursor::MoveTo(left_margin as u16, (header_y + 1) as u16), Print(&line_padded))?;
-            } else {
-                for i in 0..entries_to_show {
-                    let entry = &self.file_picker_entries[i];
-                    let prefix = if i == self.file_picker_selection { " >" } else { "  " };
-                    let line = format!("{}{}", prefix, entry.display);
-                    let line_padded = pad_to_width(&truncate_to_width(&line, content_width), content_width);
-                    let y = (header_y + 1 + i) as u16;
-                    if i == self.file_picker_selection {
-                        queue!(out, cursor::MoveTo(left_margin as u16, y),
-                            SetAttribute(Attribute::Reverse),
-                            Print(&line_padded),
-                            SetAttribute(Attribute::Reset))?;
-                    } else {
-                        queue!(out, cursor::MoveTo(left_margin as u16, y), Print(&line_padded))?;
-                    }
+            match self.file_picker_view {
+                FilePickerView::Simple => {
+                    self.render_simple_picker(out, width, height, &dir_str)?;
+                }
+                FilePickerView::Manager => {
+                    self.render_manager_picker(out, width, height, &dir_str)?;
                 }
             }
-
-            let status_padded = pad_to_width(&truncate_to_width(status, content_width), content_width);
-            let status_y = (header_y + 1 + entries_to_show) as u16;
-            queue!(out, cursor::MoveTo(left_margin as u16, status_y),
-                SetAttribute(Attribute::Reverse), Print(&status_padded), SetAttribute(Attribute::Reset))?;
 
             out.flush()?;
             self.needs_redraw = false;
@@ -2127,6 +2412,168 @@ impl Editor {
         self.request_full_redraw();
     }
 
+    fn render_simple_picker(&self, out: &mut Stdout, width: usize, height: usize, dir_str: &str) -> io::Result<()> {
+        let header = format!(" {}", dir_str);
+        let status = "Tab: Manager | ↑/↓ navigate  Enter open  Backspace parent  Esc new buffer";
+
+        let entries_to_show = cmp::min(self.file_picker_entries.len(), height.saturating_sub(9));
+        let empty_msg = if self.file_picker_entries.is_empty() { " (empty directory)" } else { "" };
+        let max_entry_width = self.file_picker_entries.iter()
+            .map(|e| e.display.len() + 2).max().unwrap_or(0);
+
+        let logo_width = VAN_LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let content_width = cmp::min(
+            cmp::max(
+                cmp::max(logo_width, header.chars().count()),
+                cmp::max(max_entry_width + empty_msg.len(), status.chars().count()),
+            ),
+            width,
+        );
+
+        let logo_height = VAN_LOGO.len();
+        let box_height = logo_height + 1 + 1 + entries_to_show + 1;
+        let top_margin = height.saturating_sub(box_height) / 2;
+        let left_margin = width.saturating_sub(content_width) / 2;
+
+        let left_pad = content_width.saturating_sub(logo_width) / 2;
+        let logo_indent = " ".repeat(left_pad);
+        for (i, logo_line) in VAN_LOGO.iter().enumerate() {
+            let display = format!("{}{}", logo_indent, logo_line);
+            let line_padded = pad_to_width(&display, content_width);
+            queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
+                SetForegroundColor(Color::Blue), Print(&line_padded), ResetColor)?;
+        }
+
+        let header_padded = pad_to_width(&truncate_to_width(&header, content_width), content_width);
+        let header_y = top_margin + logo_height + 1;
+        queue!(out, cursor::MoveTo(left_margin as u16, header_y as u16),
+            SetAttribute(Attribute::Reverse), Print(&header_padded), SetAttribute(Attribute::Reset))?;
+
+        if self.file_picker_entries.is_empty() {
+            let line_padded = pad_to_width(&truncate_to_width(empty_msg, content_width), content_width);
+            queue!(out, cursor::MoveTo(left_margin as u16, (header_y + 1) as u16), Print(&line_padded))?;
+        } else {
+            for i in 0..entries_to_show {
+                let entry = &self.file_picker_entries[i];
+                let prefix = if i == self.file_picker_selection { " >" } else { "  " };
+                let line = format!("{}{}", prefix, entry.display);
+                let line_padded = pad_to_width(&truncate_to_width(&line, content_width), content_width);
+                let y = (header_y + 1 + i) as u16;
+                if i == self.file_picker_selection {
+                    queue!(out, cursor::MoveTo(left_margin as u16, y),
+                        SetAttribute(Attribute::Reverse),
+                        Print(&line_padded),
+                        SetAttribute(Attribute::Reset))?;
+                } else {
+                    queue!(out, cursor::MoveTo(left_margin as u16, y), Print(&line_padded))?;
+                }
+            }
+        }
+
+        let status_padded = pad_to_width(&truncate_to_width(status, content_width), content_width);
+        let status_y = (header_y + 1 + entries_to_show) as u16;
+        queue!(out, cursor::MoveTo(left_margin as u16, status_y),
+            SetAttribute(Attribute::Reverse), Print(&status_padded), SetAttribute(Attribute::Reset))?;
+
+        Ok(())
+    }
+
+    fn render_manager_picker(&self, out: &mut Stdout, width: usize, height: usize, dir_str: &str) -> io::Result<()> {
+        let header = format!(" {}", dir_str);
+
+        let prompt_active = self.prompt_state != PromptState::None;
+        let pending_active = self.pending_file_op.is_some();
+
+        let status = if prompt_active {
+            match &self.prompt_state {
+                PromptState::ConfirmDelete { .. } => "Delete? (y/n)".to_string(),
+                PromptState::ConfirmOverwrite { .. } => "Overwrite? (y/n)".to_string(),
+                PromptState::InputRename { .. } => format!("Rename to: {}", self.prompt_input),
+                PromptState::InputCreateFile => format!("New file: {}", self.prompt_input),
+                PromptState::InputCreateDir => format!("New dir: {}", self.prompt_input),
+                PromptState::None => unreachable!(),
+            }
+        } else if pending_active {
+            match &self.pending_file_op {
+                Some(PendingFileOp::Copy { source }) =>
+                    format!("Copy: {} — navigate, press x", source.file_name().unwrap_or_default().to_string_lossy()),
+                Some(PendingFileOp::Move { source }) =>
+                    format!("Move: {} — navigate, press x", source.file_name().unwrap_or_default().to_string_lossy()),
+                None => String::new(),
+            }
+        } else {
+            "h:hidden r:refresh n:file N:dir d:delete R:rename c:copy m:move  Tab:Simple".to_string()
+        };
+
+        let entries_to_show = cmp::min(self.file_picker_entries.len(), height.saturating_sub(9));
+        let empty_msg = if self.file_picker_entries.is_empty() && !prompt_active && !pending_active { " (empty directory)" } else { "" };
+        let max_entry_width = self.file_picker_entries.iter()
+            .map(|e| e.display.len() + 12 + 2).max().unwrap_or(0);
+
+        let logo_width = VAN_LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let content_width = cmp::min(
+            cmp::max(
+                cmp::max(logo_width, header.chars().count()),
+                cmp::max(max_entry_width + empty_msg.len(), status.chars().count()),
+            ),
+            width,
+        );
+
+        let logo_height = VAN_LOGO.len();
+        let box_height = logo_height + 1 + 1 + entries_to_show + 1;
+        let top_margin = height.saturating_sub(box_height) / 2;
+        let left_margin = width.saturating_sub(content_width) / 2;
+
+        let left_pad = content_width.saturating_sub(logo_width) / 2;
+        let logo_indent = " ".repeat(left_pad);
+        for (i, logo_line) in VAN_LOGO.iter().enumerate() {
+            let display = format!("{}{}", logo_indent, logo_line);
+            let line_padded = pad_to_width(&display, content_width);
+            queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
+                SetForegroundColor(Color::Blue), Print(&line_padded), ResetColor)?;
+        }
+
+        let header_padded = pad_to_width(&truncate_to_width(&header, content_width), content_width);
+        let header_y = top_margin + logo_height + 1;
+        queue!(out, cursor::MoveTo(left_margin as u16, header_y as u16),
+            SetAttribute(Attribute::Reverse), Print(&header_padded), SetAttribute(Attribute::Reset))?;
+
+        if self.file_picker_entries.is_empty() && !prompt_active && !pending_active {
+            let line_padded = pad_to_width(&truncate_to_width(empty_msg, content_width), content_width);
+            queue!(out, cursor::MoveTo(left_margin as u16, (header_y + 1) as u16), Print(&line_padded))?;
+        } else {
+            for i in 0..entries_to_show {
+                let entry = &self.file_picker_entries[i];
+                let prefix = if i == self.file_picker_selection { " >" } else { "  " };
+                let size_str = if entry.is_dir { String::new() } else { format!(" {:>10}", format_size(entry.size)) };
+                let line = format!("{}{}{}", prefix, entry.display, size_str);
+                let line_padded = pad_to_width(&truncate_to_width(&line, content_width), content_width);
+                let y = (header_y + 1 + i) as u16;
+                if i == self.file_picker_selection {
+                    queue!(out, cursor::MoveTo(left_margin as u16, y),
+                        SetAttribute(Attribute::Reverse),
+                        Print(&line_padded),
+                        SetAttribute(Attribute::Reset))?;
+                } else {
+                    queue!(out, cursor::MoveTo(left_margin as u16, y), Print(&line_padded))?;
+                }
+            }
+        }
+
+        let status_padded = pad_to_width(&truncate_to_width(&status, content_width), content_width);
+        let status_y = (header_y + 1 + entries_to_show) as u16;
+        queue!(out, cursor::MoveTo(left_margin as u16, status_y),
+            SetAttribute(Attribute::Reverse), Print(&status_padded), SetAttribute(Attribute::Reset))?;
+
+        if prompt_active && matches!(self.prompt_state, PromptState::InputRename { .. } | PromptState::InputCreateFile | PromptState::InputCreateDir) {
+            queue!(out, cursor::Show)?;
+        } else {
+            queue!(out, cursor::Hide)?;
+        }
+
+        Ok(())
+    }
+
     fn find_first(&self, query: &str) -> Option<(usize, usize)> {
         for y in 0..self.buffer.len() {
             let line = self.buffer.get_line(y);
@@ -2161,4 +2608,19 @@ fn pad_to_width(s: &str, width: usize) -> String {
         out.push_str(&" ".repeat(width - len));
     }
     out
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{} {}", bytes, UNITS[unit_idx])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_idx])
+    }
 }
