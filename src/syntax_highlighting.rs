@@ -1,5 +1,6 @@
 use crossterm::style::Color;
 use std::path::PathBuf;
+use crate::config::SyntaxColors;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Language {
@@ -128,7 +129,7 @@ fn is_builtin(word: &str, lang: Language) -> bool {
     builtins.contains(&word)
 }
 
-pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
+pub fn tokenize(line: &str, lang: Language, colors: &SyntaxColors) -> Vec<(String, Option<Color>)> {
     let mut out: Vec<(String, Option<Color>)> = Vec::new();
     let chars: Vec<char> = line.chars().collect();
     let len = chars.len();
@@ -146,7 +147,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
             let rest: String = chars[i..].iter().collect();
             if rest.starts_with(comment_start) {
                 let text: String = chars[i..].iter().collect();
-                out.push((sanitize_str(&text), Some(Color::DarkGreen)));
+                out.push((sanitize_str(&text), colors.comment));
                 break;
             }
         }
@@ -154,7 +155,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
             && i + 1 < len && chars[i] == '/' && chars[i + 1] == '/'
         {
             let text: String = chars[i..].iter().collect();
-            out.push((sanitize_str(&text), Some(Color::DarkGreen)));
+            out.push((sanitize_str(&text), colors.comment));
             break;
         }
 
@@ -164,7 +165,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
             while j < len && chars[j] == '#' { j += 1; }
             if j < len && chars[j] == ' ' {
                 let text: String = chars[i..].iter().collect();
-                out.push((sanitize_str(&text), Some(Color::Blue)));
+                out.push((sanitize_str(&text), colors.markdown_heading));
                 break;
             }
         }
@@ -175,7 +176,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
             if let Some(close) = rest.find('`') {
                 let end = i + 1 + close + 1;
                 let text: String = chars[i..=end].iter().collect();
-                out.push((sanitize_str(&text), Some(Color::Green)));
+                out.push((sanitize_str(&text), colors.markdown_code));
                 i = end + 1;
                 continue;
             }
@@ -187,7 +188,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
             if let Some(close) = rest.find("**") {
                 let end = i + 2 + close + 1;
                 let text: String = chars[i..=end].iter().collect();
-                out.push((sanitize_str(&text), Some(Color::DarkYellow)));
+                out.push((sanitize_str(&text), colors.markdown_bold));
                 i = end + 1;
                 continue;
             }
@@ -199,7 +200,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
             if let Some(close) = rest.find('*') {
                 let end = i + 1 + close;
                 let text: String = chars[i..=end].iter().collect();
-                out.push((sanitize_str(&text), Some(Color::DarkYellow)));
+                out.push((sanitize_str(&text), colors.markdown_bold));
                 i = end + 1;
                 continue;
             }
@@ -214,7 +215,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                     if let Some(cp) = url_rest.find(')') {
                         let end = i + 1 + cb + 1 + 1 + cp;
                         let text: String = chars[i..=end].iter().collect();
-                        out.push((sanitize_str(&text), Some(Color::Cyan)));
+                        out.push((sanitize_str(&text), colors.markdown_link));
                         i = end + 1;
                         continue;
                     }
@@ -225,7 +226,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
         // # comment in non-Markdown languages
         if lang != Language::Markdown && chars[i] == '#' {
             let text: String = chars[i..].iter().collect();
-            out.push((sanitize_str(&text), Some(Color::DarkGreen)));
+            out.push((sanitize_str(&text), colors.comment));
             break;
         }
 
@@ -240,7 +241,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                 s.push(chars[i]);
                 i += 1;
             }
-            out.push((s, Some(Color::Cyan)));
+            out.push((s, colors.lifetime));
             continue;
         }
 
@@ -261,7 +262,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                         acc.push(chars[i]); i += 1;
                     } else if chars[i] == '$' {
                         if !acc.is_empty() {
-                            out.push((sanitize_str(&acc), Some(Color::Yellow)));
+                            out.push((sanitize_str(&acc), colors.string_double));
                             acc = String::new();
                         }
                         let mut var = String::new();
@@ -280,7 +281,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                         } else if i < len {
                             var.push(chars[i]); i += 1;
                         }
-                        out.push((sanitize_str(&var), Some(Color::DarkYellow)));
+                        out.push((sanitize_str(&var), colors.variable));
                     } else if chars[i] == '"' {
                         acc.push('"'); i += 1;
                         break;
@@ -290,7 +291,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                 }
 
                 if !acc.is_empty() {
-                    out.push((sanitize_str(&acc), Some(Color::Yellow)));
+                    out.push((sanitize_str(&acc), colors.string_double));
                 }
                 continue;
             }
@@ -311,7 +312,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                 i += 1;
             }
 
-            let color = if quote == '"' { Some(Color::Yellow) } else { Some(Color::Green) };
+            let color = if quote == '"' { colors.string_double } else { colors.string_single };
             out.push((sanitize_str(&s), color));
             continue;
         }
@@ -345,7 +346,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                 out.push(("$".to_string(), None));
                 continue;
             }
-            out.push((sanitize_str(&s), Some(Color::DarkYellow)));
+            out.push((sanitize_str(&s), colors.variable));
             continue;
         }
 
@@ -358,7 +359,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                 s.push(chars[i]);
                 i += 1;
             }
-            out.push((s, Some(Color::Cyan)));
+            out.push((s, colors.decorator));
             continue;
         }
 
@@ -373,7 +374,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                 s.push(chars[i]);
                 i += 1;
             }
-            out.push((s, Some(Color::Magenta)));
+            out.push((s, colors.number));
             continue;
         }
 
@@ -385,15 +386,15 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                 i += 1;
             }
             let color = if is_keyword(&s, lang) {
-                Some(Color::Blue)
+                colors.keyword
             } else if is_type(&s, lang) {
-                Some(Color::Cyan)
+                colors.type_name
             } else if is_builtin(&s, lang) {
-                Some(Color::DarkYellow)
+                colors.builtin
             } else if (lang == Language::Python) && (s == "self" || s == "cls") {
-                Some(Color::DarkYellow)
+                colors.builtin
             } else if (lang == Language::Python) && s.starts_with("__") && s.ends_with("__") && s.len() > 4 {
-                Some(Color::DarkYellow)
+                colors.builtin
             } else {
                 None
             };
@@ -414,7 +415,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                     s.push(chars[i]);
                     i += 1;
                 }
-                out.push((s, Some(Color::Cyan)));
+                out.push((s, colors.lifetime));
                 continue;
             }
             if s == "'" && i < len && chars[i].is_alphabetic() {
@@ -424,7 +425,7 @@ pub fn tokenize(line: &str, lang: Language) -> Vec<(String, Option<Color>)> {
                     s.push(chars[i]);
                     i += 1;
                 }
-                out.push((s, Some(Color::Cyan)));
+                out.push((s, colors.lifetime));
                 continue;
             }
         }

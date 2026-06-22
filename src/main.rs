@@ -1,6 +1,6 @@
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     execute, queue,
     style::{Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
@@ -22,6 +22,25 @@ mod config;
 mod syntax_highlighting;
 use syntax_highlighting::{Language, detect_language, tokenize, sanitize_str};
 
+fn key_event_to_string(key: &KeyEvent) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        parts.push("ctrl".to_string());
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        parts.push("alt".to_string());
+    }
+    let key_name = match key.code {
+        KeyCode::Char(c) if c.is_ascii_alphanumeric() => c.to_ascii_lowercase().to_string(),
+        _ => return None,
+    };
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(key_name);
+    Some(parts.join("+"))
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const VAN_LOGO: &[&str] = &[
     "░██    ░██                       ",
@@ -30,7 +49,18 @@ const VAN_LOGO: &[&str] = &[
     "░██    ░██       ░██  ░██    ░██ ",
     " ░██  ░██   ░███████  ░██    ░██ ",
     "  ░██░██   ░██   ░██  ░██    ░██ ",
-    "   ░███     ░█████░██ ░██    ░██ ",
+    "   ░███     ░███████  ░██    ░██ ",
+];
+const CONFIG_LOGO: &[&str] = &[
+    "  ░██████                            ░████ ░██           ",
+    " ░██   ░██                          ░██                  ",
+    "░██         ░███████  ░████████  ░████████ ░██ ░████████",
+    "░██        ░██    ░██ ░██    ░██    ░██    ░██░██    ░██",
+    "░██        ░██    ░██ ░██    ░██    ░██    ░██░██    ░██",
+    " ░██   ░██ ░██    ░██ ░██    ░██    ░██    ░██░██   ░███",
+    "  ░██████   ░███████  ░██    ░██    ░██    ░██ ░█████░██ ",
+    "                                                     ░██",
+    "                                               ░███████ ",
 ];
 const SEARCH_STATUS_SECONDS: u64 = 5;
 const MESSAGE_STATUS_SECONDS: u64 = 3;
@@ -237,6 +267,11 @@ fn main() -> io::Result<()> {
                         break;
                     }
                 }
+                Event::Mouse(mouse) => {
+                    if editor.handle_mouse(mouse) {
+                        break;
+                    }
+                }
                 Event::Resize(w, h) => {
                     if editor.handle_resize(w, h) {
                         editor.request_full_redraw();
@@ -266,7 +301,11 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter(out: &mut Stdout) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(out, terminal::EnterAlternateScreen, event::EnableBracketedPaste)?;
+        execute!(out,
+            terminal::EnterAlternateScreen,
+            event::EnableBracketedPaste,
+            event::EnableMouseCapture,
+        )?;
         Ok(Self)
     }
 }
@@ -274,7 +313,13 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = stdout();
-        let _ = execute!(out, event::DisableBracketedPaste, cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            out,
+            event::DisableMouseCapture,
+            event::DisableBracketedPaste,
+            cursor::Show,
+            terminal::LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -326,6 +371,7 @@ enum InputMode {
     AwaitAiKey,
     AiConfig,
     FilePicker,
+    ConfigTui,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -552,6 +598,35 @@ struct Editor {
     show_hidden: bool,
     git_branch: Option<String>,
     git_refreshed: Instant,
+    config_tui: ConfigTuiState,
+}
+
+#[derive(Clone)]
+struct ConfigTuiState {
+    cursor: usize,
+    scroll: usize,
+    expanded: [bool; 4],
+    edit_mode: Option<ConfigEditMode>,
+    edit_buffer: String,
+    edit_cursor: usize,
+}
+
+#[derive(Clone)]
+enum ConfigEditMode {
+    StyleField,
+    ColorField(usize),
+    KeybindField(String),
+}
+
+#[derive(Clone, Copy)]
+enum ConfigTuiItem {
+    Section(usize),
+    Style,
+    Position,
+    ContentToggle(usize),
+    ColorField(usize),
+    KeybindField(usize),
+    Button(&'static str),
 }
 
 impl Editor {
@@ -605,6 +680,14 @@ impl Editor {
             show_hidden: false,
             git_branch: None,
             git_refreshed: Instant::now(),
+            config_tui: ConfigTuiState {
+                cursor: 0,
+                scroll: 0,
+                expanded: [true, false, false, false],
+                edit_mode: None,
+                edit_buffer: String::new(),
+                edit_cursor: 0,
+            },
         };
 
         if editor.mode == InputMode::FilePicker {
@@ -832,6 +915,20 @@ impl Editor {
                         self.set_temp_status("Opened new buffer".to_string(), MESSAGE_STATUS_SECONDS);
                         self.request_full_redraw();
                     }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        if !is_ctrl {
+                            self.mode = InputMode::ConfigTui;
+                            self.config_tui = ConfigTuiState {
+                                cursor: 0,
+                                scroll: 0,
+                                expanded: [true, true, false, false],
+                                edit_mode: None,
+                                edit_buffer: String::new(),
+                                edit_cursor: 0,
+                            };
+                            self.request_full_redraw();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -926,6 +1023,18 @@ impl Editor {
                         KeyCode::Char('h') => {
                             self.show_hidden = !self.show_hidden;
                             self.refresh_file_picker();
+                            self.request_full_redraw();
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            self.mode = InputMode::ConfigTui;
+                            self.config_tui = ConfigTuiState {
+                                cursor: 0,
+                                scroll: 0,
+                                expanded: [true, true, false, false],
+                                edit_mode: None,
+                                edit_buffer: String::new(),
+                                edit_cursor: 0,
+                            };
                             self.request_full_redraw();
                         }
                         KeyCode::Char('r') => {
@@ -1173,52 +1282,55 @@ impl Editor {
             return false;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('x') => {
-                    if !self.buffer.dirty {
-                        return true;
+        if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+            if let Some(lookup) = key_event_to_string(&key) {
+                if let Some(action) = self.config.keybindings.lookup(&lookup) {
+                    match action {
+                        config::EditorAction::Exit => {
+                            if !self.buffer.dirty {
+                                return true;
+                            }
+                            self.confirm_exit = true;
+                            self.request_redraw();
+                            return false;
+                        }
+                        config::EditorAction::Save => {
+                            if self.save().is_ok() {
+                                self.set_temp_status(format!("SAVED: {}", self.filename), MESSAGE_STATUS_SECONDS);
+                            } else {
+                                self.set_temp_status(format!("Save failed: {}", self.filename), MESSAGE_STATUS_SECONDS);
+                            }
+                            self.request_redraw();
+                            return false;
+                        }
+                        config::EditorAction::Find => {
+                            self.in_search = true;
+                            if self.search_highlight.is_empty() {
+                                self.search_input.clear();
+                            } else {
+                                self.search_input = self.search_highlight.clone();
+                            }
+                            self.request_redraw();
+                            return false;
+                        }
+                        config::EditorAction::Undo => {
+                            if self.undo() {
+                                self.set_temp_status("Undid last edit".to_string(), MESSAGE_STATUS_SECONDS);
+                            } else {
+                                self.set_temp_status("Nothing to undo".to_string(), MESSAGE_STATUS_SECONDS);
+                            }
+                            self.request_full_redraw();
+                            return false;
+                        }
+                        config::EditorAction::ToggleLineNumbers => {
+                            self.show_line_numbers = !self.show_line_numbers;
+                            let status = if self.show_line_numbers { "on" } else { "off" };
+                            self.set_temp_status(format!("Line numbers {}", status), MESSAGE_STATUS_SECONDS);
+                            self.request_full_redraw();
+                            return false;
+                        }
                     }
-                    self.confirm_exit = true;
-                    self.request_redraw();
                 }
-
-                KeyCode::Char('s') => {
-                    if self.save().is_ok() {
-                        self.set_temp_status(format!("SAVED: {}", self.filename), MESSAGE_STATUS_SECONDS);
-                    } else {
-                        self.set_temp_status(format!("Save failed: {}", self.filename), MESSAGE_STATUS_SECONDS);
-                    }
-                    self.request_redraw();
-                }
-
-                KeyCode::Char('f') => {
-                    self.in_search = true;
-                    if self.search_highlight.is_empty() {
-                        self.search_input.clear();
-                    } else {
-                        self.search_input = self.search_highlight.clone();
-                    }
-                    self.request_redraw();
-                }
-
-                KeyCode::Char('z') => {
-                    if self.undo() {
-                        self.set_temp_status("Undid last edit".to_string(), MESSAGE_STATUS_SECONDS);
-                    } else {
-                        self.set_temp_status("Nothing to undo".to_string(), MESSAGE_STATUS_SECONDS);
-                    }
-                    self.request_full_redraw();
-                }
-
-                KeyCode::Char('l') => {
-                    self.show_line_numbers = !self.show_line_numbers;
-                    let status = if self.show_line_numbers { "on" } else { "off" };
-                    self.set_temp_status(format!("Line numbers {}", status), MESSAGE_STATUS_SECONDS);
-                    self.request_full_redraw();
-                }
-
-                _ => {}
             }
         }
 
@@ -1397,10 +1509,15 @@ impl Editor {
 
             InputMode::Insert => {}
             InputMode::FilePicker => {}
+            InputMode::ConfigTui => {}
         }
 
         if self.mode == InputMode::FilePicker {
             return self.handle_file_picker_key(key);
+        }
+
+        if self.mode == InputMode::ConfigTui {
+            return self.handle_config_tui_key(key);
         }
 
         match key.code {
@@ -1965,7 +2082,7 @@ impl Editor {
                 Some(format!("{}{}", prefix, self.filename))
             }
             "binds" => {
-                Some("Ctrl+S Save | Ctrl+F Find | Ctrl+Z Undo | Ctrl+L Lines | Ctrl+X Exit".to_string())
+                Some(self.config.keybindings.display_binds())
             }
             "git" => {
                 self.git_branch.as_ref().map(|b| format!("git:({})", b))
@@ -2064,6 +2181,15 @@ impl Editor {
                 }
             }
 
+            out.flush()?;
+            self.needs_redraw = false;
+            self.force_full_redraw = false;
+            return Ok(());
+        }
+
+        if self.mode == InputMode::ConfigTui {
+            queue!(out, Clear(ClearType::All), cursor::Hide)?;
+            self.render_config_tui(out, width, height)?;
             out.flush()?;
             self.needs_redraw = false;
             self.force_full_redraw = false;
@@ -2317,7 +2443,7 @@ impl Editor {
     }
 
     fn write_colored(&self, out: &mut Stdout, line: &str, offset_chars: usize, width: usize) -> io::Result<()> {
-        let segments = tokenize(line, self.language);
+        let segments = tokenize(line, self.language, &self.config.syntax_colors);
         let mut char_pos = 0;
         let visible_end = offset_chars + width;
 
@@ -2565,7 +2691,7 @@ impl Editor {
 
     fn render_simple_picker(&self, out: &mut Stdout, width: usize, height: usize, dir_str: &str) -> io::Result<()> {
         let header = format!(" {}", dir_str);
-        let status = "Tab: Manager | ↑/↓ navigate  Enter open  Backspace parent  Esc new buffer";
+        let status = "Tab:Manager | ↑/↓ Enter Backspace Esc | S:Config";
 
         let entries_to_show = cmp::min(self.file_picker_entries.len(), height.saturating_sub(9));
         let empty_msg = if self.file_picker_entries.is_empty() { " (empty directory)" } else { "" };
@@ -2650,7 +2776,7 @@ impl Editor {
                 None => String::new(),
             }
         } else {
-            "h:hidden r:refresh n:file N:dir d:delete R:rename c:copy m:move  Tab:Simple".to_string()
+            "h:hidden r:refresh n:file N:dir d:delete R:rename c:copy m:move  Tab:Simple  S:Config".to_string()
         };
 
         let entries_to_show = cmp::min(self.file_picker_entries.len(), height.saturating_sub(9));
@@ -2719,6 +2845,574 @@ impl Editor {
         Ok(())
     }
 
+    // ── Config TUI ──────────────────────────────────────────────
+
+    fn render_config_tui(&self, out: &mut Stdout, width: usize, height: usize) -> io::Result<()> {
+        let style = &self.config.style;
+        let header = " CONFIG ";
+        let status_hint = "Esc:Cancel  ↑↓  Enter:Toggle  ←→:Cycle  S:Save";
+
+        let item_count = self.config_tui_item_count();
+        let scroll = self.config_tui.scroll;
+
+        let max_item_width = self.max_config_item_width();
+        let logo_width = CONFIG_LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let content_width = cmp::min(
+            cmp::max(
+                cmp::max(logo_width, header.len()),
+                cmp::max(max_item_width, status_hint.len()),
+            ),
+            width.saturating_sub(4),
+        );
+        let logo_height = CONFIG_LOGO.len();
+        let box_height = logo_height + 2 + 1 + item_count + 1;
+        let top_margin = if box_height >= height { 0 } else { (height - box_height) / 2 };
+        let left_margin = (width - content_width) / 2;
+
+        // logo centered
+        let logo_color = style.logo_color();
+        let left_pad = content_width.saturating_sub(logo_width) / 2;
+        let logo_indent = " ".repeat(left_pad);
+        for (i, logo_line) in CONFIG_LOGO.iter().enumerate() {
+            let display = format!("{}{}", logo_indent, logo_line);
+            let line_padded = pad_to_width(&display, content_width);
+            queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
+                SetForegroundColor(logo_color.to_crossterm()), Print(&line_padded), ResetColor)?;
+        }
+
+        // header line
+        let header_padded = pad_to_width(&truncate_to_width(header, content_width), content_width);
+        let header_y = top_margin + logo_height + 1;
+        self.render_styled_box_line(out, &header_padded, left_margin, header_y, content_width)?;
+
+        // items
+        let mut rendered = 0usize;
+        for item_idx in scroll..item_count {
+            let screen_y = header_y + 1 + rendered;
+            if screen_y >= height.saturating_sub(1) { break; }
+            rendered += 1;
+            let is_focused = item_idx == self.config_tui.cursor;
+            let prefix = if is_focused { " >" } else { "  " };
+            let line = match self.config_tui_item(item_idx) {
+                Some(item) => self.config_tui_item_render(item, content_width.saturating_sub(4)),
+                None => String::new(),
+            };
+            let display = format!("{}{}", prefix, line);
+            let line_padded = pad_to_width(&truncate_to_width(&display, content_width), content_width);
+            if is_focused {
+                self.render_styled_box_line(out, &line_padded, left_margin, screen_y, content_width)?;
+            } else {
+                queue!(out, cursor::MoveTo(left_margin as u16, screen_y as u16), Print(&line_padded))?;
+            }
+        }
+
+        // status line right after items
+        let status_y = header_y + 1 + rendered;
+        let status_padded = pad_to_width(&truncate_to_width(status_hint, content_width), content_width);
+        self.render_styled_box_line(out, &status_padded, left_margin, status_y, content_width)?;
+
+        Ok(())
+    }
+
+    fn max_config_item_width(&self) -> usize {
+        let mut max_w = 0usize;
+        for i in 0..self.config_tui_item_count() {
+            if let Some(item) = self.config_tui_item(i) {
+                let w = self.config_tui_item_render(item, 1000).len() + 4;
+                if w > max_w { max_w = w; }
+            }
+        }
+        max_w
+    }
+
+    fn config_tui_item_count(&self) -> usize {
+        let mut n = 4;
+        if self.config_tui.expanded[0] { n += 1; }
+        if self.config_tui.expanded[1] { n += 1 + 4; }
+        if self.config_tui.expanded[2] { n += 14; }
+        if self.config_tui.expanded[3] { n += 5; }
+        n += 3;
+        n
+    }
+
+    fn config_tui_item(&self, idx: usize) -> Option<ConfigTuiItem> {
+        let mut i = 0;
+        macro_rules! check { ($val:expr) => { if i == idx { return Some($val); } i += 1; }; }
+        check!(ConfigTuiItem::Section(0));
+        if self.config_tui.expanded[0] { check!(ConfigTuiItem::Style); }
+        check!(ConfigTuiItem::Section(1));
+        if self.config_tui.expanded[1] {
+            check!(ConfigTuiItem::Position);
+            for t in 0..4 { check!(ConfigTuiItem::ContentToggle(t)); }
+        }
+        check!(ConfigTuiItem::Section(2));
+        if self.config_tui.expanded[2] {
+            for c in 0..14 { check!(ConfigTuiItem::ColorField(c)); }
+        }
+        check!(ConfigTuiItem::Section(3));
+        if self.config_tui.expanded[3] {
+            for k in 0..5 { check!(ConfigTuiItem::KeybindField(k)); }
+        }
+        check!(ConfigTuiItem::Button("Load Defaults"));
+        check!(ConfigTuiItem::Button("Save & Exit"));
+        check!(ConfigTuiItem::Button("Cancel"));
+        None
+    }
+
+    fn config_tui_item_render(&self, item: ConfigTuiItem, max_w: usize) -> String {
+        let trunc = |s: &str| truncate_to_width(s, max_w);
+        match item {
+            ConfigTuiItem::Section(idx) => {
+                let name = ["Theme", "Status Bar", "Syntax Colors", "Keybindings"][idx];
+                let arrow = if self.config_tui.expanded[idx] { "▼" } else { "▶" };
+                trunc(&format!(" {} {}", arrow, name))
+            }
+            ConfigTuiItem::Style => {
+                let display = if matches!(self.config_tui.edit_mode, Some(ConfigEditMode::StyleField)) {
+                    let buf = &self.config_tui.edit_buffer;
+                    let pos = self.config_tui.edit_cursor.min(buf.len());
+                    let (left, right) = buf.split_at(pos);
+                    format!("{}|{}", left, right)
+                } else {
+                    let cur = &self.config.style;
+                    let base = cur.style_string();
+                    let detail = match cur {
+                        config::UiStyle::StaticColor(c) => format!(":{}", c.hex_str()),
+                        config::UiStyle::SmoothGradient { from, to } | config::UiStyle::RoughGradient { from, to } => {
+                            format!(":{}:{}", from.hex_str(), to.hex_str())
+                        }
+                        _ => String::new(),
+                    };
+                    format!("{}{}", base, detail)
+                };
+                trunc(&format!(" Style       {}", display))
+            }
+            ConfigTuiItem::Position => {
+                let s = match self.config.status_bar_position {
+                    config::StatusBarPosition::Bottom => "bottom",
+                    config::StatusBarPosition::Top => "top",
+                };
+                trunc(&format!(" Position    {}", s))
+            }
+            ConfigTuiItem::ContentToggle(idx) => {
+                let labels = ["filename", "git", "time", "binds"];
+                let checked = self.config.status_bar_content.contains(&labels[idx].to_string());
+                trunc(&format!("   [{}] {}", if checked { "x" } else { " " }, labels[idx]))
+            }
+            ConfigTuiItem::ColorField(idx) => {
+                let labels = ["comment", "string_double", "string_single", "number",
+                    "keyword", "type_name", "builtin", "decorator", "variable",
+                    "lifetime", "markdown_heading", "markdown_bold", "markdown_code", "markdown_link"];
+                let val = if matches!(self.config_tui.edit_mode, Some(ConfigEditMode::ColorField(i)) if i == idx) {
+                    let buf = &self.config_tui.edit_buffer;
+                    let pos = self.config_tui.edit_cursor.min(buf.len());
+                    let (left, right) = buf.split_at(pos);
+                    format!("{}|{}", left, right)
+                } else {
+                    color_display_name(self.color_field_value(idx))
+                };
+                trunc(&format!(" {:<16} {}", labels[idx], val))
+            }
+            ConfigTuiItem::KeybindField(idx) => {
+                let actions = [config::EditorAction::Save, config::EditorAction::Find,
+                    config::EditorAction::Undo, config::EditorAction::ToggleLineNumbers,
+                    config::EditorAction::Exit];
+                let names = ["save", "find", "undo", "lines", "exit"];
+                let key = self.config.keybindings.key_for_action(actions[idx]);
+                trunc(&format!(" {:<16} {}", names[idx], key))
+            }
+            ConfigTuiItem::Button(label) => trunc(&format!(" [{}]", label)),
+        }
+    }
+
+    fn color_field_value(&self, idx: usize) -> Option<crossterm::style::Color> {
+        let sc = &self.config.syntax_colors;
+        match idx {
+            0 => sc.comment, 1 => sc.string_double, 2 => sc.string_single,
+            3 => sc.number, 4 => sc.keyword, 5 => sc.type_name,
+            6 => sc.builtin, 7 => sc.decorator, 8 => sc.variable,
+            9 => sc.lifetime, 10 => sc.markdown_heading, 11 => sc.markdown_bold,
+            12 => sc.markdown_code, 13 => sc.markdown_link,
+            _ => None,
+        }
+    }
+
+    fn set_color_field(&mut self, idx: usize, color: Option<crossterm::style::Color>) {
+        let sc = &mut self.config.syntax_colors;
+        match idx {
+            0 => sc.comment = color, 1 => sc.string_double = color,
+            2 => sc.string_single = color, 3 => sc.number = color,
+            4 => sc.keyword = color, 5 => sc.type_name = color,
+            6 => sc.builtin = color, 7 => sc.decorator = color,
+            8 => sc.variable = color, 9 => sc.lifetime = color,
+            10 => sc.markdown_heading = color, 11 => sc.markdown_bold = color,
+            12 => sc.markdown_code = color, 13 => sc.markdown_link = color,
+            _ => {}
+        }
+    }
+
+    fn handle_config_tui_key(&mut self, key: KeyEvent) -> bool {
+        if let Some(ref mode) = self.config_tui.edit_mode.clone() {
+            match mode {
+                ConfigEditMode::ColorField(idx) => {
+                    let idx = *idx;
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.config_tui.edit_mode = None;
+                            self.config_tui.edit_buffer.clear();
+                            self.request_full_redraw();
+                            return false;
+                        }
+                        KeyCode::Enter => {
+                            let val = self.config_tui.edit_buffer.trim().to_string();
+                            if val.is_empty() || val.eq_ignore_ascii_case("no") || val.eq_ignore_ascii_case("none") || val == "null" {
+                                self.set_color_field(idx, None);
+                            } else if let Some(c) = parse_color_name(&val) {
+                                self.set_color_field(idx, Some(c));
+                            }
+                            self.config_tui.edit_mode = None;
+                            self.config_tui.edit_buffer.clear();
+                            self.request_full_redraw();
+                            return false;
+                        }
+                        KeyCode::Left => {
+                            if self.config_tui.edit_cursor > 0 {
+                                self.config_tui.edit_cursor -= 1;
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Right => {
+                            if self.config_tui.edit_cursor < self.config_tui.edit_buffer.len() {
+                                self.config_tui.edit_cursor += 1;
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if self.config_tui.edit_cursor > 0 {
+                                let pos = self.config_tui.edit_cursor;
+                                self.config_tui.edit_buffer.remove(pos - 1);
+                                self.config_tui.edit_cursor -= 1;
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            let pos = self.config_tui.edit_cursor;
+                            self.config_tui.edit_buffer.insert(pos, c);
+                            self.config_tui.edit_cursor += 1;
+                            self.request_redraw();
+                        }
+                        _ => {}
+                    }
+                    return false;
+                }
+                ConfigEditMode::StyleField => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.config_tui.edit_mode = None;
+                            self.config_tui.edit_buffer.clear();
+                            self.request_full_redraw();
+                            return false;
+                        }
+                        KeyCode::Enter => {
+                            let val = self.config_tui.edit_buffer.trim().to_string();
+                            if !val.is_empty() {
+                                self.config.style = config::UiStyle::parse(&val);
+                            }
+                            self.config_tui.edit_mode = None;
+                            self.config_tui.edit_buffer.clear();
+                            self.request_full_redraw();
+                            return false;
+                        }
+                        KeyCode::Left => {
+                            if self.config_tui.edit_cursor > 0 {
+                                self.config_tui.edit_cursor -= 1;
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Right => {
+                            if self.config_tui.edit_cursor < self.config_tui.edit_buffer.len() {
+                                self.config_tui.edit_cursor += 1;
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if self.config_tui.edit_cursor > 0 {
+                                let pos = self.config_tui.edit_cursor;
+                                self.config_tui.edit_buffer.remove(pos - 1);
+                                self.config_tui.edit_cursor -= 1;
+                                self.request_redraw();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            let pos = self.config_tui.edit_cursor;
+                            self.config_tui.edit_buffer.insert(pos, c);
+                            self.config_tui.edit_cursor += 1;
+                            self.request_redraw();
+                        }
+                        _ => {}
+                    }
+                    return false;
+                }
+                ConfigEditMode::KeybindField(action_name) => {
+                    let action = config::EditorAction::parse(action_name);
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.config_tui.edit_mode = None;
+                            self.request_full_redraw();
+                            return false;
+                        }
+                        _ => {
+                            if let (Some(action), Some(lookup)) = (action, key_event_to_string(&key)) {
+                                self.config.keybindings.set_binding(&lookup, action);
+                            }
+                            self.config_tui.edit_mode = None;
+                            self.request_full_redraw();
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                if self.config_tui.cursor > 0 {
+                    self.config_tui.cursor -= 1;
+                    self.request_full_redraw();
+                }
+            }
+            KeyCode::Down => {
+                let max = self.config_tui_item_count().saturating_sub(1);
+                if self.config_tui.cursor < max {
+                    self.config_tui.cursor += 1;
+                    self.request_full_redraw();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.activate_config_tui_item(self.config_tui.cursor);
+                self.request_full_redraw();
+            }
+            KeyCode::Left => {
+                self.cycle_config_tui_item(self.config_tui.cursor, -1);
+                self.request_full_redraw();
+            }
+            KeyCode::Right => {
+                self.cycle_config_tui_item(self.config_tui.cursor, 1);
+                self.request_full_redraw();
+            }
+            KeyCode::Esc => {
+                self.config = config::load_config();
+                self.mode = InputMode::FilePicker;
+                self.request_full_redraw();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn activate_config_tui_item(&mut self, idx: usize) {
+        match self.config_tui_item(idx) {
+            Some(ConfigTuiItem::Section(s)) => {
+                self.config_tui.expanded[s] = !self.config_tui.expanded[s];
+            }
+            Some(ConfigTuiItem::ContentToggle(t)) => {
+                let labels = ["filename", "git", "time", "binds"];
+                let label = labels[t].to_string();
+                if self.config.status_bar_content.contains(&label) {
+                    self.config.status_bar_content.retain(|x| *x != label);
+                    if self.config.status_bar_content.is_empty() {
+                        self.config.status_bar_content.push("filename".to_string());
+                    }
+                } else {
+                    self.config.status_bar_content.push(label);
+                }
+            }
+            Some(ConfigTuiItem::Style) => {
+                let cur = &self.config.style;
+                let base = cur.style_string();
+                let detail = match cur {
+                    config::UiStyle::StaticColor(c) => format!(":{}", c.hex_str()),
+                    config::UiStyle::SmoothGradient { from, to } | config::UiStyle::RoughGradient { from, to } => {
+                        format!(":{}:{}", from.hex_str(), to.hex_str())
+                    }
+                    _ => String::new(),
+                };
+                self.config_tui.edit_mode = Some(ConfigEditMode::StyleField);
+                self.config_tui.edit_buffer = format!("{}{}", base, detail);
+            }
+            Some(ConfigTuiItem::ColorField(idx)) => {
+                self.config_tui.edit_mode = Some(ConfigEditMode::ColorField(idx));
+                self.config_tui.edit_buffer = color_display_name(self.color_field_value(idx));
+            }
+            Some(ConfigTuiItem::KeybindField(idx)) => {
+                let names = ["save", "find", "undo", "lines", "exit"];
+                self.config_tui.edit_mode = Some(ConfigEditMode::KeybindField(names[idx].to_string()));
+                self.config_tui.edit_buffer.clear();
+            }
+            Some(ConfigTuiItem::Button(label)) => {
+                match label {
+                    "Load Defaults" => self.config = config::VanConfig::default(),
+                    "Save & Exit" => { self.save_config_to_disk(); self.mode = InputMode::FilePicker; }
+                    "Cancel" => { self.config = config::load_config(); self.mode = InputMode::FilePicker; }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cycle_config_tui_item(&mut self, idx: usize, dir: isize) {
+        match self.config_tui_item(idx) {
+            Some(ConfigTuiItem::Style) => {
+                let styles = ["white", "dark", "miami", "smooth_gradient:ff0000:00ff00", "rough_gradient:0000ff:00ff00", "static_color:ff6600"];
+                let cur = self.config.style.style_string();
+                let pos = styles.iter().position(|s| {
+                    s.starts_with(cur) || (cur == "smooth_gradient" && s.starts_with("smooth_gradient"))
+                        || (cur == "rough_gradient" && s.starts_with("rough_gradient"))
+                        || (cur == "static_color" && s.starts_with("static_color"))
+                }).unwrap_or(0);
+                let next = (pos as isize + dir).rem_euclid(styles.len() as isize) as usize;
+                self.config.style = config::UiStyle::parse(styles[next]);
+            }
+            Some(ConfigTuiItem::Position) => {
+                self.config.status_bar_position = if self.config.status_bar_position == config::StatusBarPosition::Bottom {
+                    config::StatusBarPosition::Top
+                } else {
+                    config::StatusBarPosition::Bottom
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                match self.mode {
+                    InputMode::FilePicker => {
+                        self.file_picker_selection = self.file_picker_selection.saturating_sub(1);
+                        self.request_redraw();
+                    }
+                    InputMode::ConfigTui => {
+                        if self.config_tui.cursor > 0 {
+                            self.config_tui.cursor -= 1;
+                            self.request_full_redraw();
+                        }
+                    }
+                    _ => {
+                        if self.cursor_y > 0 {
+                            self.cursor_y -= 1;
+                            self.request_redraw();
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                match self.mode {
+                    InputMode::FilePicker => {
+                        let max = self.file_picker_entries.len().saturating_sub(1);
+                        self.file_picker_selection = cmp::min(self.file_picker_selection + 1, max);
+                        self.request_redraw();
+                    }
+                    InputMode::ConfigTui => {
+                        let max_cursor = self.config_tui_item_count().saturating_sub(1);
+                        if self.config_tui.cursor < max_cursor {
+                            self.config_tui.cursor += 1;
+                            self.request_full_redraw();
+                        }
+                    }
+                    _ => {
+                        if self.cursor_y + 1 < self.buffer.len() {
+                            self.cursor_y += 1;
+                            self.request_redraw();
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.mode == InputMode::ConfigTui => {
+                let screen_y = mouse.row as usize;
+                let height = self.last_size.1 as usize;
+                if screen_y >= height { return false; }
+                let logo_height = CONFIG_LOGO.len();
+                let item_count = self.config_tui_item_count();
+                let box_height = logo_height + 2 + 1 + item_count + 1;
+                let top_margin = if box_height >= height { 0 } else { (height - box_height) / 2 };
+                let item_start_y = top_margin + logo_height + 2;
+                if screen_y >= item_start_y {
+                    let item_idx = self.config_tui.scroll + screen_y - item_start_y;
+                    if item_idx < self.config_tui_item_count() {
+                        self.config_tui.cursor = item_idx;
+                        self.activate_config_tui_item(item_idx);
+                        self.request_full_redraw();
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn save_config_to_disk(&self) {
+        let sc = &self.config.syntax_colors;
+        let color_val = |c: Option<crossterm::style::Color>| -> serde_json::Value {
+            match c {
+                None => serde_json::Value::Null,
+                Some(c) => serde_json::Value::String(color_display_name(Some(c))),
+            }
+        };
+        let pos_str = match self.config.status_bar_position {
+            config::StatusBarPosition::Bottom => "bottom",
+            config::StatusBarPosition::Top => "top",
+        };
+        let content: Vec<serde_json::Value> = self.config.status_bar_content.iter()
+            .map(|s| serde_json::Value::String(s.clone())).collect();
+        let mut kb_map = serde_json::Map::new();
+        let actions = [
+            (config::EditorAction::Save, "save"),
+            (config::EditorAction::Find, "find"),
+            (config::EditorAction::Undo, "undo"),
+            (config::EditorAction::ToggleLineNumbers, "lines"),
+            (config::EditorAction::Exit, "exit"),
+        ];
+        for (action, name) in &actions {
+            kb_map.insert(name.to_string(), serde_json::Value::String(self.config.keybindings.key_for_action(*action)));
+        }
+        let style_str = {
+            let cur = &self.config.style;
+            let base = cur.style_string();
+            match cur {
+                config::UiStyle::StaticColor(c) => format!("{}:{}", base, c.hex_str()),
+                config::UiStyle::SmoothGradient { from, to } | config::UiStyle::RoughGradient { from, to } => {
+                    format!("{}:{}:{}", base, from.hex_str(), to.hex_str())
+                }
+                _ => base.to_string(),
+            }
+        };
+        let json = serde_json::json!({
+            "theme": {
+                "style": style_str,
+                "status_bar": {
+                    "position": pos_str,
+                    "content": content,
+                }
+            },
+            "syntax": {
+                "comment": color_val(sc.comment), "string_double": color_val(sc.string_double),
+                "string_single": color_val(sc.string_single), "number": color_val(sc.number),
+                "keyword": color_val(sc.keyword), "type_name": color_val(sc.type_name),
+                "builtin": color_val(sc.builtin), "decorator": color_val(sc.decorator),
+                "variable": color_val(sc.variable), "lifetime": color_val(sc.lifetime),
+                "markdown_heading": color_val(sc.markdown_heading), "markdown_bold": color_val(sc.markdown_bold),
+                "markdown_code": color_val(sc.markdown_code), "markdown_link": color_val(sc.markdown_link),
+            },
+            "keybindings": kb_map,
+        });
+        if let Some(path) = config::config_path() {
+            if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+            if let Ok(content) = serde_json::to_string_pretty(&json) { let _ = fs::write(&path, content); }
+        }
+    }
+
     fn find_first(&self, query: &str) -> Option<(usize, usize)> {
         for y in 0..self.buffer.len() {
             let line = self.buffer.get_line(y);
@@ -2753,6 +3447,68 @@ fn pad_to_width(s: &str, width: usize) -> String {
         out.push_str(&" ".repeat(width - len));
     }
     out
+}
+
+fn color_display_name(c: Option<crossterm::style::Color>) -> String {
+    use crossterm::style::Color;
+    match c {
+        None => "no".to_string(),
+        Some(Color::Black) => "black".to_string(),
+        Some(Color::DarkGrey) => "dark_grey".to_string(),
+        Some(Color::Red) => "red".to_string(),
+        Some(Color::DarkRed) => "dark_red".to_string(),
+        Some(Color::Green) => "green".to_string(),
+        Some(Color::DarkGreen) => "dark_green".to_string(),
+        Some(Color::Yellow) => "yellow".to_string(),
+        Some(Color::DarkYellow) => "dark_yellow".to_string(),
+        Some(Color::Blue) => "blue".to_string(),
+        Some(Color::DarkBlue) => "dark_blue".to_string(),
+        Some(Color::Magenta) => "magenta".to_string(),
+        Some(Color::DarkMagenta) => "dark_magenta".to_string(),
+        Some(Color::Cyan) => "cyan".to_string(),
+        Some(Color::DarkCyan) => "dark_cyan".to_string(),
+        Some(Color::White) => "white".to_string(),
+        Some(Color::Grey) => "grey".to_string(),
+        Some(Color::Rgb { r, g, b }) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+        Some(Color::AnsiValue(v)) => format!("ansi({})", v),
+        Some(Color::Reset) => "reset".to_string(),
+    }
+}
+
+fn parse_color_name(s: &str) -> Option<crossterm::style::Color> {
+    use crossterm::style::Color;
+    match s.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        "reset" => Some(Color::Reset),
+        "black" => Some(Color::Black),
+        "darkgrey" | "darkgray" => Some(Color::DarkGrey),
+        "red" => Some(Color::Red),
+        "darkred" => Some(Color::DarkRed),
+        "green" => Some(Color::Green),
+        "darkgreen" => Some(Color::DarkGreen),
+        "yellow" => Some(Color::Yellow),
+        "darkyellow" => Some(Color::DarkYellow),
+        "blue" => Some(Color::Blue),
+        "darkblue" => Some(Color::DarkBlue),
+        "magenta" => Some(Color::Magenta),
+        "darkmagenta" => Some(Color::DarkMagenta),
+        "cyan" => Some(Color::Cyan),
+        "darkcyan" => Some(Color::DarkCyan),
+        "white" => Some(Color::White),
+        "grey" | "gray" => Some(Color::Grey),
+        _ => {
+            let hex = s.trim_start_matches('#');
+            if hex.len() == 6 {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    u8::from_str_radix(&hex[0..2], 16),
+                    u8::from_str_radix(&hex[2..4], 16),
+                    u8::from_str_radix(&hex[4..6], 16),
+                ) {
+                    return Some(Color::Rgb { r, g, b });
+                }
+            }
+            None
+        }
+    }
 }
 
 fn format_size(bytes: u64) -> String {
