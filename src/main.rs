@@ -2,7 +2,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use std::{
@@ -18,17 +18,19 @@ use std::{
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
+mod config;
 mod syntax_highlighting;
 use syntax_highlighting::{Language, detect_language, tokenize, sanitize_str};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const VAN_LOGO: &[&str] = &[
-    "__      __",
-    "\\ \\    / /",
-    " \\ \\  / /_ _ _ __",
-    "  \\ \\/ / _` | '_ \\",
-    "   \\  / (_| | | | |",
-    "    \\/ \\__,_|_| |_|",
+    "░██    ░██                       ",
+    "░██    ░██                       ",
+    "░██    ░██  ░██████   ░████████  ",
+    "░██    ░██       ░██  ░██    ░██ ",
+    " ░██  ░██   ░███████  ░██    ░██ ",
+    "  ░██░██   ░██   ░██  ░██    ░██ ",
+    "   ░███     ░█████░██ ░██    ░██ ",
 ];
 const SEARCH_STATUS_SECONDS: u64 = 5;
 const MESSAGE_STATUS_SECONDS: u64 = 3;
@@ -106,17 +108,7 @@ impl AiConfig {
 }
 
 fn ai_config_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("van").join("ai_config.json"))
-}
-
-fn config_dir() -> Option<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        Some(PathBuf::from(xdg))
-    } else if let Some(home) = env::var_os("HOME") {
-        Some(PathBuf::from(home).join(".config"))
-    } else {
-        env::var_os("USERPROFILE").map(PathBuf::from)
-    }
+    config::config_dir().map(|d| d.join("van").join("ai_config.json"))
 }
 
 fn load_ai_config() -> AiConfig {
@@ -149,7 +141,7 @@ fn load_ai_config() -> AiConfig {
                     migrate_key_to_keyring("groq", &k);
                     migrated = true;
                 }
-                let _ = fs::remove_file(config_dir().map(|d| d.join("van_groq_api_key")).unwrap());
+                let _ = fs::remove_file(config::config_dir().map(|d| d.join("van_groq_api_key")).unwrap());
             }
 
             if migrated {
@@ -172,7 +164,7 @@ fn migrate_key_to_keyring(provider: &str, key: &str) {
 }
 
 fn load_old_groq_key() -> Option<String> {
-    let base = config_dir()?;
+    let base = config::config_dir()?;
     let path = base.join("van_groq_api_key");
     let key = fs::read_to_string(path).ok()?;
     let trimmed = key.trim().to_string();
@@ -546,6 +538,7 @@ struct Editor {
     ai_output: Option<Vec<String>>,
     ai_scroll: usize,
 
+    config: config::VanConfig,
     syntax_highlight: bool,
     show_line_numbers: bool,
 
@@ -557,6 +550,8 @@ struct Editor {
     prompt_input: String,
     pending_file_op: Option<PendingFileOp>,
     show_hidden: bool,
+    git_branch: Option<String>,
+    git_refreshed: Instant,
 }
 
 impl Editor {
@@ -595,6 +590,7 @@ impl Editor {
             last_rendered_rows: Vec::new(),
             last_size: (0, 0),
 
+            config: config::load_config(),
             ai_output: None,
             ai_scroll: 0,
             syntax_highlight: true,
@@ -607,6 +603,8 @@ impl Editor {
             prompt_input: String::new(),
             pending_file_op: None,
             show_hidden: false,
+            git_branch: None,
+            git_refreshed: Instant::now(),
         };
 
         if editor.mode == InputMode::FilePicker {
@@ -1028,7 +1026,52 @@ impl Editor {
         Duration::from_millis(POLL_FALLBACK_MS)
     }
 
+    fn refresh_git_branch(&mut self) {
+        if self.git_refreshed.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        self.git_refreshed = Instant::now();
+        let dir = if self.filename.is_empty() {
+            match std::env::current_dir() {
+                Ok(d) => d,
+                Err(_) => return,
+            }
+        } else {
+            let p = std::path::Path::new(&self.filename);
+            if p.is_absolute() {
+                match p.parent() {
+                    Some(d) => d.to_path_buf(),
+                    None => return,
+                }
+            } else {
+                match std::env::current_dir() {
+                    Ok(mut d) => {
+                        d.push(&self.filename);
+                        d.pop();
+                        d
+                    }
+                    Err(_) => return,
+                }
+            }
+        };
+        let out = match std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["branch", "--show-current"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return,
+        };
+        let branch = match String::from_utf8(out.stdout) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => return,
+        };
+        self.git_branch = if branch.is_empty() { None } else { Some(branch) };
+    }
+
     fn tick(&mut self) -> bool {
+        self.refresh_git_branch();
         if let Some((_, until)) = &self.temp_status {
             if Instant::now() >= *until {
                 self.temp_status = None;
@@ -1904,11 +1947,34 @@ impl Editor {
             }
         }
 
-        let dirty = if self.buffer.dirty { "*" } else { "" };
-        format!(
-            "{}{} | Ctrl+S Save | Ctrl+F Find | Ctrl+Z Undo | Ctrl+L Lines | Ctrl+X Exit | Esc Command",
-            dirty, self.filename
-        )
+        let parts: Vec<String> = self.config.status_bar_content.iter()
+            .filter_map(|token| self.status_token_value(token))
+            .collect();
+
+        if parts.is_empty() {
+            self.filename.clone()
+        } else {
+            parts.join(" | ")
+        }
+    }
+
+    fn status_token_value(&self, token: &str) -> Option<String> {
+        match token {
+            "filename" => {
+                let prefix = if self.buffer.dirty { "*" } else { "" };
+                Some(format!("{}{}", prefix, self.filename))
+            }
+            "binds" => {
+                Some("Ctrl+S Save | Ctrl+F Find | Ctrl+Z Undo | Ctrl+L Lines | Ctrl+X Exit".to_string())
+            }
+            "git" => {
+                self.git_branch.as_ref().map(|b| format!("git:({})", b))
+            }
+            "time" => {
+                Some(chrono::Local::now().format("%H:%M").to_string())
+            }
+            _ => None,
+        }
     }
 
     fn update_scroll(&mut self, width: usize, height: usize) {
@@ -1974,8 +2040,8 @@ impl Editor {
             let status = "AI CONFIG";
             let padded = pad_to_width(&truncate_to_width(status, width), width);
             if height > 0 {
-                queue!(out, cursor::MoveTo(0, (height - 1) as u16),
-                    SetAttribute(Attribute::Reverse), Print(padded), SetAttribute(Attribute::Reset))?;
+                queue!(out, cursor::MoveTo(0, (height - 1) as u16))?;
+                self.render_styled_status_bar(out, &padded, width)?;
             }
 
             out.flush()?;
@@ -2021,13 +2087,8 @@ impl Editor {
             let padded = pad_to_width(&truncate_to_width(status, width), width);
 
             if height > 0 {
-                queue!(
-                    out,
-                    cursor::MoveTo(0, (height - 1) as u16),
-                    SetAttribute(Attribute::Reverse),
-                    Print(padded),
-                    SetAttribute(Attribute::Reset)
-                )?;
+                queue!(out, cursor::MoveTo(0, (height - 1) as u16))?;
+                self.render_styled_status_bar(out, &padded, width)?;
             }
 
             out.flush()?;
@@ -2038,8 +2099,11 @@ impl Editor {
 
         self.update_scroll(width, height);
 
+        use config::StatusBarPosition as Sbp;
+        let status_on_top = self.config.status_bar_position == Sbp::Top;
         let text_rows = height.saturating_sub(1);
-        let status_row = height.saturating_sub(1);
+        let text_offset: usize = if status_on_top { 1 } else { 0 };
+        let status_row = if status_on_top { 0 } else { height.saturating_sub(1) };
 
         let current_rows = self.build_rows(width, text_rows);
 
@@ -2055,7 +2119,7 @@ impl Editor {
             if full_redraw || new_text != old_text {
                 queue!(
                     out,
-                    cursor::MoveTo(0, row as u16),
+                    cursor::MoveTo(0, (row + text_offset) as u16),
                     Clear(ClearType::CurrentLine)
                 )?;
                 self.draw_visible_line(out, row, width)?;
@@ -2071,14 +2135,8 @@ impl Editor {
             .unwrap_or("");
 
         if full_redraw || padded_status != old_status {
-            queue!(
-                out,
-                cursor::MoveTo(0, status_row as u16),
-                SetAttribute(Attribute::Reverse),
-                Clear(ClearType::CurrentLine),
-                Print(&padded_status),
-                SetAttribute(Attribute::Reset)
-            )?;
+            queue!(out, cursor::MoveTo(0, status_row as u16), Clear(ClearType::CurrentLine))?;
+            self.render_styled_status_bar(out, &padded_status, width)?;
         }
 
         if height > 0 {
@@ -2092,7 +2150,7 @@ impl Editor {
                 .cursor_y
                 .saturating_sub(self.offset_y)
                 .min(text_rows.saturating_sub(1)) as u16;
-            queue!(out, cursor::Show, cursor::MoveTo(cx, cy))?;
+            queue!(out, cursor::Show, cursor::MoveTo(cx, cy + text_offset as u16))?;
         }
 
         out.flush()?;
@@ -2180,11 +2238,14 @@ impl Editor {
                 }
 
                 let end = abs + query.len();
+                let sbg = self.config.style.bg_at(0, 1);
+                let sfg = sbg.text_color();
                 queue!(
                     out,
-                    SetAttribute(Attribute::Reverse),
+                    SetBackgroundColor(sbg.to_crossterm()),
+                    SetForegroundColor(sfg.to_crossterm()),
                     Print(sanitize_str(&visible[abs..end])),
-                    SetAttribute(Attribute::Reset)
+                    ResetColor
                 )?;
 
                 idx = end;
@@ -2194,6 +2255,64 @@ impl Editor {
             }
         }
 
+        Ok(())
+    }
+
+    fn render_styled_status_bar(&self, out: &mut Stdout, text: &str, width: usize) -> io::Result<()> {
+        let style = &self.config.style;
+        match style {
+            config::UiStyle::White | config::UiStyle::Dark | config::UiStyle::StaticColor(_) => {
+                let bg = style.bg_at(0, width);
+                let fg = bg.text_color();
+                queue!(out,
+                    SetBackgroundColor(bg.to_crossterm()),
+                    SetForegroundColor(fg.to_crossterm()),
+                    Print(text),
+                    ResetColor
+                )?;
+            }
+            _ => {
+                for (i, ch) in text.chars().enumerate() {
+                    let bg = style.bg_at(i, width);
+                    let fg = bg.text_color();
+                    queue!(out,
+                        SetBackgroundColor(bg.to_crossterm()),
+                        SetForegroundColor(fg.to_crossterm()),
+                        Print(ch.to_string()),
+                    )?;
+                }
+                queue!(out, ResetColor)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn render_styled_box_line(&self, out: &mut Stdout, text: &str, x: usize, y: usize, box_width: usize) -> io::Result<()> {
+        let style = &self.config.style;
+        queue!(out, cursor::MoveTo(x as u16, y as u16))?;
+        match style {
+            config::UiStyle::White | config::UiStyle::Dark | config::UiStyle::StaticColor(_) => {
+                let bg = style.bg_at(0, box_width);
+                let fg = bg.text_color();
+                queue!(out,
+                    SetBackgroundColor(bg.to_crossterm()),
+                    SetForegroundColor(fg.to_crossterm()),
+                    Print(text),
+                )?;
+            }
+            _ => {
+                for (i, ch) in text.chars().enumerate() {
+                    let bg = style.bg_at(i, box_width);
+                    let fg = bg.text_color();
+                    queue!(out,
+                        SetBackgroundColor(bg.to_crossterm()),
+                        SetForegroundColor(fg.to_crossterm()),
+                        Print(ch.to_string()),
+                    )?;
+                }
+            }
+        }
+        queue!(out, ResetColor)?;
         Ok(())
     }
 
@@ -2467,19 +2586,20 @@ impl Editor {
         let top_margin = height.saturating_sub(box_height) / 2;
         let left_margin = width.saturating_sub(content_width) / 2;
 
+        let logo_color = self.config.style.logo_color();
+
         let left_pad = content_width.saturating_sub(logo_width) / 2;
         let logo_indent = " ".repeat(left_pad);
         for (i, logo_line) in VAN_LOGO.iter().enumerate() {
             let display = format!("{}{}", logo_indent, logo_line);
             let line_padded = pad_to_width(&display, content_width);
             queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
-                SetForegroundColor(Color::Blue), Print(&line_padded), ResetColor)?;
+                SetForegroundColor(logo_color.to_crossterm()), Print(&line_padded), ResetColor)?;
         }
 
         let header_padded = pad_to_width(&truncate_to_width(&header, content_width), content_width);
         let header_y = top_margin + logo_height + 1;
-        queue!(out, cursor::MoveTo(left_margin as u16, header_y as u16),
-            SetAttribute(Attribute::Reverse), Print(&header_padded), SetAttribute(Attribute::Reset))?;
+        self.render_styled_box_line(out, &header_padded, left_margin, header_y, content_width)?;
 
         if self.file_picker_entries.is_empty() {
             let line_padded = pad_to_width(&truncate_to_width(empty_msg, content_width), content_width);
@@ -2492,10 +2612,7 @@ impl Editor {
                 let line_padded = pad_to_width(&truncate_to_width(&line, content_width), content_width);
                 let y = (header_y + 1 + i) as u16;
                 if i == self.file_picker_selection {
-                    queue!(out, cursor::MoveTo(left_margin as u16, y),
-                        SetAttribute(Attribute::Reverse),
-                        Print(&line_padded),
-                        SetAttribute(Attribute::Reset))?;
+                    self.render_styled_box_line(out, &line_padded, left_margin, y as usize, content_width)?;
                 } else {
                     queue!(out, cursor::MoveTo(left_margin as u16, y), Print(&line_padded))?;
                 }
@@ -2504,8 +2621,7 @@ impl Editor {
 
         let status_padded = pad_to_width(&truncate_to_width(status, content_width), content_width);
         let status_y = (header_y + 1 + entries_to_show) as u16;
-        queue!(out, cursor::MoveTo(left_margin as u16, status_y),
-            SetAttribute(Attribute::Reverse), Print(&status_padded), SetAttribute(Attribute::Reset))?;
+        self.render_styled_box_line(out, &status_padded, left_margin, status_y as usize, content_width)?;
 
         Ok(())
     }
@@ -2556,19 +2672,20 @@ impl Editor {
         let top_margin = height.saturating_sub(box_height) / 2;
         let left_margin = width.saturating_sub(content_width) / 2;
 
+        let logo_color = self.config.style.logo_color();
+
         let left_pad = content_width.saturating_sub(logo_width) / 2;
         let logo_indent = " ".repeat(left_pad);
         for (i, logo_line) in VAN_LOGO.iter().enumerate() {
             let display = format!("{}{}", logo_indent, logo_line);
             let line_padded = pad_to_width(&display, content_width);
             queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
-                SetForegroundColor(Color::Blue), Print(&line_padded), ResetColor)?;
+                SetForegroundColor(logo_color.to_crossterm()), Print(&line_padded), ResetColor)?;
         }
 
         let header_padded = pad_to_width(&truncate_to_width(&header, content_width), content_width);
         let header_y = top_margin + logo_height + 1;
-        queue!(out, cursor::MoveTo(left_margin as u16, header_y as u16),
-            SetAttribute(Attribute::Reverse), Print(&header_padded), SetAttribute(Attribute::Reset))?;
+        self.render_styled_box_line(out, &header_padded, left_margin, header_y, content_width)?;
 
         if self.file_picker_entries.is_empty() && !prompt_active && !pending_active {
             let line_padded = pad_to_width(&truncate_to_width(empty_msg, content_width), content_width);
@@ -2582,10 +2699,7 @@ impl Editor {
                 let line_padded = pad_to_width(&truncate_to_width(&line, content_width), content_width);
                 let y = (header_y + 1 + i) as u16;
                 if i == self.file_picker_selection {
-                    queue!(out, cursor::MoveTo(left_margin as u16, y),
-                        SetAttribute(Attribute::Reverse),
-                        Print(&line_padded),
-                        SetAttribute(Attribute::Reset))?;
+                    self.render_styled_box_line(out, &line_padded, left_margin, y as usize, content_width)?;
                 } else {
                     queue!(out, cursor::MoveTo(left_margin as u16, y), Print(&line_padded))?;
                 }
@@ -2594,8 +2708,7 @@ impl Editor {
 
         let status_padded = pad_to_width(&truncate_to_width(&status, content_width), content_width);
         let status_y = (header_y + 1 + entries_to_show) as u16;
-        queue!(out, cursor::MoveTo(left_margin as u16, status_y),
-            SetAttribute(Attribute::Reverse), Print(&status_padded), SetAttribute(Attribute::Reset))?;
+        self.render_styled_box_line(out, &status_padded, left_margin, status_y as usize, content_width)?;
 
         if prompt_active && matches!(self.prompt_state, PromptState::InputRename { .. } | PromptState::InputCreateFile | PromptState::InputCreateDir) {
             queue!(out, cursor::Show)?;
