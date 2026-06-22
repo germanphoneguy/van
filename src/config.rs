@@ -390,6 +390,8 @@ pub struct VanConfig {
     pub status_bar_content: Vec<String>,
     pub syntax_colors: SyntaxColors,
     pub keybindings: KeyBindings,
+    pub ascii_shadow: bool,
+    pub shelf_3d: bool,
 }
 
 impl Default for VanConfig {
@@ -400,6 +402,8 @@ impl Default for VanConfig {
             status_bar_content: vec!["filename".to_string(), "binds".to_string()],
             syntax_colors: SyntaxColors::default(),
             keybindings: KeyBindings::default(),
+            ascii_shadow: true,
+            shelf_3d: false,
         }
     }
 }
@@ -573,6 +577,12 @@ pub fn load_config() -> VanConfig {
                     config.status_bar_content = items;
                 }
             }
+        }
+        if let Some(val) = theme.get("ascii_shadow").and_then(|v| v.as_bool()) {
+            config.ascii_shadow = val;
+        }
+        if let Some(val) = theme.get("shelf_3d").and_then(|v| v.as_bool()) {
+            config.shelf_3d = val;
         }
     }
 

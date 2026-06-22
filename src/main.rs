@@ -304,7 +304,6 @@ impl TerminalGuard {
         execute!(out,
             terminal::EnterAlternateScreen,
             event::EnableBracketedPaste,
-            event::EnableMouseCapture,
         )?;
         Ok(Self)
     }
@@ -315,7 +314,6 @@ impl Drop for TerminalGuard {
         let mut out = stdout();
         let _ = execute!(
             out,
-            event::DisableMouseCapture,
             event::DisableBracketedPaste,
             cursor::Show,
             terminal::LeaveAlternateScreen
@@ -605,7 +603,7 @@ struct Editor {
 struct ConfigTuiState {
     cursor: usize,
     scroll: usize,
-    expanded: [bool; 4],
+    expanded: [bool; 5],
     edit_mode: Option<ConfigEditMode>,
     edit_buffer: String,
     edit_cursor: usize,
@@ -626,6 +624,7 @@ enum ConfigTuiItem {
     ContentToggle(usize),
     ColorField(usize),
     KeybindField(usize),
+    MenuToggle(usize),
     Button(&'static str),
 }
 
@@ -683,7 +682,7 @@ impl Editor {
             config_tui: ConfigTuiState {
                 cursor: 0,
                 scroll: 0,
-                expanded: [true, false, false, false],
+                expanded: [true, false, false, false, false],
                 edit_mode: None,
                 edit_buffer: String::new(),
                 edit_cursor: 0,
@@ -918,10 +917,11 @@ impl Editor {
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         if !is_ctrl {
                             self.mode = InputMode::ConfigTui;
+                            let _ = execute!(stdout(), event::EnableMouseCapture);
                             self.config_tui = ConfigTuiState {
                                 cursor: 0,
                                 scroll: 0,
-                                expanded: [true, true, false, false],
+                                expanded: [true, true, false, false, false],
                                 edit_mode: None,
                                 edit_buffer: String::new(),
                                 edit_cursor: 0,
@@ -1027,10 +1027,11 @@ impl Editor {
                         }
                         KeyCode::Char('s') | KeyCode::Char('S') => {
                             self.mode = InputMode::ConfigTui;
+                            let _ = execute!(stdout(), event::EnableMouseCapture);
                             self.config_tui = ConfigTuiState {
                                 cursor: 0,
                                 scroll: 0,
-                                expanded: [true, true, false, false],
+                                expanded: [true, true, false, false, false],
                                 edit_mode: None,
                                 edit_buffer: String::new(),
                                 edit_cursor: 0,
@@ -2415,6 +2416,12 @@ impl Editor {
 
     fn render_styled_box_line(&self, out: &mut Stdout, text: &str, x: usize, y: usize, box_width: usize) -> io::Result<()> {
         let style = &self.config.style;
+        let display = if self.config.shelf_3d {
+            let inner = &text[..text.len().min(box_width.saturating_sub(2))];
+            format!("░{}█", pad_to_width(inner, box_width.saturating_sub(2)))
+        } else {
+            text.to_string()
+        };
         queue!(out, cursor::MoveTo(x as u16, y as u16))?;
         match style {
             config::UiStyle::White | config::UiStyle::Dark | config::UiStyle::StaticColor(_) => {
@@ -2423,13 +2430,13 @@ impl Editor {
                 queue!(out,
                     SetBackgroundColor(bg.to_crossterm()),
                     SetForegroundColor(fg.to_crossterm()),
-                    Print(text),
+                    Print(&display),
                 )?;
             }
             _ => {
-                for (i, ch) in text.chars().enumerate() {
+                for (i, ch) in display.chars().enumerate() {
                     let bg = style.bg_at(i, box_width);
-                    let fg = bg.text_color();
+                    let fg = if ch == '█' { bg } else { bg.text_color() };
                     queue!(out,
                         SetBackgroundColor(bg.to_crossterm()),
                         SetForegroundColor(fg.to_crossterm()),
@@ -2717,7 +2724,8 @@ impl Editor {
         let left_pad = content_width.saturating_sub(logo_width) / 2;
         let logo_indent = " ".repeat(left_pad);
         for (i, logo_line) in VAN_LOGO.iter().enumerate() {
-            let display = format!("{}{}", logo_indent, logo_line);
+            let line = if self.config.ascii_shadow { *logo_line } else { &logo_line.replace('░', " ") };
+            let display = format!("{}{}", logo_indent, line);
             let line_padded = pad_to_width(&display, content_width);
             queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
                 SetForegroundColor(logo_color.to_crossterm()), Print(&line_padded), ResetColor)?;
@@ -2803,7 +2811,8 @@ impl Editor {
         let left_pad = content_width.saturating_sub(logo_width) / 2;
         let logo_indent = " ".repeat(left_pad);
         for (i, logo_line) in VAN_LOGO.iter().enumerate() {
-            let display = format!("{}{}", logo_indent, logo_line);
+            let line = if self.config.ascii_shadow { *logo_line } else { &logo_line.replace('░', " ") };
+            let display = format!("{}{}", logo_indent, line);
             let line_padded = pad_to_width(&display, content_width);
             queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
                 SetForegroundColor(logo_color.to_crossterm()), Print(&line_padded), ResetColor)?;
@@ -2874,7 +2883,8 @@ impl Editor {
         let left_pad = content_width.saturating_sub(logo_width) / 2;
         let logo_indent = " ".repeat(left_pad);
         for (i, logo_line) in CONFIG_LOGO.iter().enumerate() {
-            let display = format!("{}{}", logo_indent, logo_line);
+            let line = if self.config.ascii_shadow { *logo_line } else { &logo_line.replace('░', " ") };
+            let display = format!("{}{}", logo_indent, line);
             let line_padded = pad_to_width(&display, content_width);
             queue!(out, cursor::MoveTo(left_margin as u16, (top_margin + i) as u16),
                 SetForegroundColor(logo_color.to_crossterm()), Print(&line_padded), ResetColor)?;
@@ -2926,11 +2936,12 @@ impl Editor {
     }
 
     fn config_tui_item_count(&self) -> usize {
-        let mut n = 4;
+        let mut n = 5;
         if self.config_tui.expanded[0] { n += 1; }
         if self.config_tui.expanded[1] { n += 1 + 4; }
         if self.config_tui.expanded[2] { n += 14; }
         if self.config_tui.expanded[3] { n += 5; }
+        if self.config_tui.expanded[4] { n += 2; }
         n += 3;
         n
     }
@@ -2953,6 +2964,10 @@ impl Editor {
         if self.config_tui.expanded[3] {
             for k in 0..5 { check!(ConfigTuiItem::KeybindField(k)); }
         }
+        check!(ConfigTuiItem::Section(4));
+        if self.config_tui.expanded[4] {
+            for t in 0..2 { check!(ConfigTuiItem::MenuToggle(t)); }
+        }
         check!(ConfigTuiItem::Button("Load Defaults"));
         check!(ConfigTuiItem::Button("Save & Exit"));
         check!(ConfigTuiItem::Button("Cancel"));
@@ -2963,7 +2978,7 @@ impl Editor {
         let trunc = |s: &str| truncate_to_width(s, max_w);
         match item {
             ConfigTuiItem::Section(idx) => {
-                let name = ["Theme", "Status Bar", "Syntax Colors", "Keybindings"][idx];
+                let name = ["Theme", "Status Bar", "Syntax Colors", "Keybindings", "Menu Config"][idx];
                 let arrow = if self.config_tui.expanded[idx] { "▼" } else { "▶" };
                 trunc(&format!(" {} {}", arrow, name))
             }
@@ -3020,6 +3035,15 @@ impl Editor {
                 let names = ["save", "find", "undo", "lines", "exit"];
                 let key = self.config.keybindings.key_for_action(actions[idx]);
                 trunc(&format!(" {:<16} {}", names[idx], key))
+            }
+            ConfigTuiItem::MenuToggle(idx) => {
+                let labels = ["ASCII shadow effect", "Shelf-/3d files effect"];
+                let val = match idx {
+                    0 => self.config.ascii_shadow,
+                    _ => self.config.shelf_3d,
+                };
+                let check = if val { "x" } else { " " };
+                trunc(&format!("   [{}] {}", check, labels[idx]))
             }
             ConfigTuiItem::Button(label) => trunc(&format!(" [{}]", label)),
         }
@@ -3203,6 +3227,7 @@ impl Editor {
             KeyCode::Esc => {
                 self.config = config::load_config();
                 self.mode = InputMode::FilePicker;
+                let _ = execute!(stdout(), event::DisableMouseCapture);
                 self.request_full_redraw();
             }
             _ => {}
@@ -3249,11 +3274,17 @@ impl Editor {
                 self.config_tui.edit_mode = Some(ConfigEditMode::KeybindField(names[idx].to_string()));
                 self.config_tui.edit_buffer.clear();
             }
+            Some(ConfigTuiItem::MenuToggle(idx)) => {
+                match idx {
+                    0 => self.config.ascii_shadow = !self.config.ascii_shadow,
+                    _ => self.config.shelf_3d = !self.config.shelf_3d,
+                }
+            }
             Some(ConfigTuiItem::Button(label)) => {
                 match label {
                     "Load Defaults" => self.config = config::VanConfig::default(),
-                    "Save & Exit" => { self.save_config_to_disk(); self.mode = InputMode::FilePicker; }
-                    "Cancel" => { self.config = config::load_config(); self.mode = InputMode::FilePicker; }
+                    "Save & Exit" => { self.save_config_to_disk(); self.mode = InputMode::FilePicker; let _ = execute!(stdout(), event::DisableMouseCapture); }
+                    "Cancel" => { self.config = config::load_config(); self.mode = InputMode::FilePicker; let _ = execute!(stdout(), event::DisableMouseCapture); }
                     _ => {}
                 }
             }
@@ -3394,7 +3425,9 @@ impl Editor {
                 "status_bar": {
                     "position": pos_str,
                     "content": content,
-                }
+                },
+                "ascii_shadow": self.config.ascii_shadow,
+                "shelf_3d": self.config.shelf_3d,
             },
             "syntax": {
                 "comment": color_val(sc.comment), "string_double": color_val(sc.string_double),
