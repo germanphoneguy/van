@@ -2154,13 +2154,14 @@ impl Editor {
         }
 
         let line = self.buffer.get_line(line_idx);
+
+        if self.search_highlight.is_empty() && self.syntax_highlight {
+            return self.write_colored(out, line, self.offset_x, text_width);
+        }
+
         let start_byte = char_to_byte_idx(line, self.offset_x);
         let end_byte = char_to_byte_idx(line, self.offset_x + text_width);
         let visible = &line[start_byte..end_byte];
-
-        if self.search_highlight.is_empty() && self.syntax_highlight {
-            return self.write_colored(out, visible);
-        }
 
         if self.search_highlight.is_empty() {
             queue!(out, Print(sanitize_str(visible)))?;
@@ -2196,15 +2197,46 @@ impl Editor {
         Ok(())
     }
 
-    fn write_colored(&self, out: &mut Stdout, visible: &str) -> io::Result<()> {
-        let segments = tokenize(visible, self.language);
+    fn write_colored(&self, out: &mut Stdout, line: &str, offset_chars: usize, width: usize) -> io::Result<()> {
+        let segments = tokenize(line, self.language);
+        let mut char_pos = 0;
+        let visible_end = offset_chars + width;
+
         for (text, color) in &segments {
-            if let Some(c) = color {
-                queue!(out, SetForegroundColor(*c), Print(text.as_str()), ResetColor)?;
-            } else {
-                queue!(out, Print(text.as_str()))?;
+            let seg_len = text.chars().count();
+            let seg_end = char_pos + seg_len;
+
+            if seg_end <= offset_chars || char_pos >= visible_end {
+                char_pos = seg_end;
+                continue;
             }
+
+            let start_skip = if char_pos < offset_chars {
+                offset_chars - char_pos
+            } else {
+                0
+            };
+            let end_trim = if seg_end > visible_end {
+                seg_end - visible_end
+            } else {
+                0
+            };
+            let trimmed: String = text.chars()
+                .skip(start_skip)
+                .take(seg_len - start_skip - end_trim)
+                .collect();
+
+            if !trimmed.is_empty() {
+                if let Some(c) = color {
+                    queue!(out, SetForegroundColor(*c), Print(trimmed.as_str()), ResetColor)?;
+                } else {
+                    queue!(out, Print(trimmed.as_str()))?;
+                }
+            }
+
+            char_pos = seg_end;
         }
+
         Ok(())
     }
 
