@@ -631,7 +631,14 @@ enum ConfigTuiItem {
 impl Editor {
     fn open(filename: Option<String>) -> Self {
         let (fname, mode) = match filename {
-            Some(f) => (f, InputMode::Insert),
+            Some(f) => {
+                if std::path::Path::new(&f).is_dir() {
+                    let _ = std::env::set_current_dir(&f);
+                    (String::new(), InputMode::FilePicker)
+                } else {
+                    (f, InputMode::Insert)
+                }
+            }
             None => (String::new(), InputMode::FilePicker),
         };
         let language = if !fname.is_empty() { detect_language(&fname) } else { Language::PlainText };
