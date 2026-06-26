@@ -2423,25 +2423,37 @@ impl Editor {
             text.to_string()
         };
         queue!(out, cursor::MoveTo(x as u16, y as u16))?;
-        match style {
-            config::UiStyle::White | config::UiStyle::Dark | config::UiStyle::StaticColor(_) => {
-                let bg = style.bg_at(0, box_width);
-                let fg = bg.text_color();
+        if self.config.shelf_3d {
+            for (i, ch) in display.chars().enumerate() {
+                let bg = style.bg_at(i, box_width);
+                let fg = if ch == '█' { bg } else { bg.text_color() };
                 queue!(out,
                     SetBackgroundColor(bg.to_crossterm()),
                     SetForegroundColor(fg.to_crossterm()),
-                    Print(&display),
+                    Print(ch.to_string()),
                 )?;
             }
-            _ => {
-                for (i, ch) in display.chars().enumerate() {
-                    let bg = style.bg_at(i, box_width);
-                    let fg = if ch == '█' { bg } else { bg.text_color() };
+        } else {
+            match style {
+                config::UiStyle::White | config::UiStyle::Dark | config::UiStyle::StaticColor(_) => {
+                    let bg = style.bg_at(0, box_width);
+                    let fg = bg.text_color();
                     queue!(out,
                         SetBackgroundColor(bg.to_crossterm()),
                         SetForegroundColor(fg.to_crossterm()),
-                        Print(ch.to_string()),
+                        Print(&display),
                     )?;
+                }
+                _ => {
+                    for (i, ch) in display.chars().enumerate() {
+                        let bg = style.bg_at(i, box_width);
+                        let fg = if ch == '█' { bg } else { bg.text_color() };
+                        queue!(out,
+                            SetBackgroundColor(bg.to_crossterm()),
+                            SetForegroundColor(fg.to_crossterm()),
+                            Print(ch.to_string()),
+                        )?;
+                    }
                 }
             }
         }
